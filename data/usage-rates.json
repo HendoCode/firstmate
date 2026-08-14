@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Model Pricing Rates",
+  "description": "Public pricing rates per million tokens (USD). Source: vendor pricing pages as of 2025.",
+  "rates": {
+    "anthropic": {
+      "claude-opus-4": {
+        "input": 15.00,
+        "output": 75.00,
+        "cache_read": 1.50,
+        "cache_write": 18.75
+      },
+      "claude-sonnet-4": {
+        "input": 3.00,
+        "output": 15.00,
+        "cache_read": 0.30,
+        "cache_write": 3.75
+      },
+      "claude-sonnet-5": {
+        "input": 3.00,
+        "output": 15.00,
+        "cache_read": 0.30,
+        "cache_write": 3.75
+      },
+      "claude-haiku-4": {
+        "input": 0.80,
+        "output": 4.00,
+        "cache_read": 0.08,
+        "cache_write": 1.00
+      }
+    },
+    "openai": {
+      "gpt-4o": {
+        "input": 2.50,
+        "output": 10.00,
+        "cache_read": 1.25,
+        "cache_write": 0.00
+      },
+      "gpt-4-turbo": {
+        "input": 10.00,
+        "output": 30.00,
+        "cache_read": 5.00,
+        "cache_write": 0.00
+      },
+      "gpt-5": {
+        "input": 2.50,
+        "output": 10.00,
+        "cache_read": 1.25,
+        "cache_write": 0.00
+      }
+    },
+    "xai": {
+      "grok-4": {
+        "input": 2.00,
+        "output": 10.00,
+        "cache_read": 0.00,
+        "cache_write": 0.00
+      },
+      "grok-5": {
+        "input": 3.00,
+        "output": 15.00,
+        "cache_read": 0.00,
+        "cache_write": 0.00
+      }
+    },
+    "deepseek": {
+      "v3": {
+        "input": 0.27,
+        "output": 1.10,
+        "cache_read": 0.07,
+        "cache_write": 0.00
+      }
+    },
+    "amazon-bedrock": {
+      "claude-opus-4": {
+        "input": 15.00,
+        "output": 75.00,
+        "cache_read": 1.50,
+        "cache_write": 18.75
+      },
+      "claude-opus-5": {
+        "input": 15.00,
+        "output": 75.00,
+        "cache_read": 1.50,
+        "cache_write": 18.75
+      },
+      "claude-sonnet-5": {
+        "input": 3.00,
+        "output": 15.00,
+        "cache_read": 0.30,
+        "cache_write": 3.75
+      },
+      "claude-haiku-4": {
+        "input": 0.80,
+        "output": 4.00,
+        "cache_read": 0.08,
+        "cache_write": 1.00
+      },
+      "grok-4": {
+        "input": 2.00,
+        "output": 10.00,
+        "cache_read": 0.00,
+        "cache_write": 0.00
+      },
+      "glm-5": {
+        "input": 0.50,
+        "output": 2.00,
+        "cache_read": 0.00,
+        "cache_write": 0.00
+      },
+      "nemotron-nano": {
+        "input": 0.50,
+        "output": 2.00,
+        "cache_read": 0.00,
+        "cache_write": 0.00
+      },
+      "nemotron-super": {
+        "input": 0.50,
+        "output": 2.00,
+        "cache_read": 0.00,
+        "cache_write": 0.00
+      },
+      "gpt-5": {
+        "input": 2.50,
+        "output": 10.00,
+        "cache_read": 1.25,
+        "cache_write": 0.00
+      },
+      "deepseek-v3": {
+        "input": 0.27,
+        "output": 1.10,
+        "cache_read": 0.07,
+        "cache_write": 0.00
+      }
+    },
+    "nvidia": {
+      "nemotron": {
+        "input": 0.50,
+        "output": 2.00,
+        "cache_read": 0.00,
+        "cache_write": 0.00
+      }
+    },
+    "zhipu": {
+      "glm": {
+        "input": 0.50,
+        "output": 2.00,
+        "cache_read": 0.00,
+        "cache_write": 0.00
+      }
+    },
+    "opencode": {
+      "big-pickle": {
+        "input": 0.00,
+        "output": 0.00,
+        "cache_read": 0.00,
+        "cache_write": 0.00
+      },
+      "default": {
+        "input": 3.00,
+        "output": 15.00,
+        "cache_read": 0.30,
+        "cache_write": 3.75
+      }
+    }
+  },
+  "fallback": {
+    "input": 3.00,
+    "output": 15.00,
+    "cache_read": 0.30,
+    "cache_write": 3.75
+  }
+}

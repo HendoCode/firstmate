@@ -805,6 +805,54 @@ test_no_run_busy_pane() {
   pass "no run + a busy semantic record reads working, attributed to its source"
 }
 
+# Regression: a crewmate that dies at or before its first turn-end hook never
+# gets a second busy-state event written, so the fm-spawn seed left by arm
+# alone used to report working indefinitely - even once the (fake) pane
+# target itself resolves to nothing more than a lingering, no-longer-agent
+# window. No other writer could ever clear that seed. Past
+# FM_BUSY_SPAWN_MAX_SECS the seed alone must stop proving the crew working.
+test_no_run_expired_spawn_seed_not_working_forever() {
+  reset_fakes
+  local d; d=$(new_case expired-spawn)
+  make_repo_on_branch "$d/wt" fm/feat-dead
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-dead.meta" "window=fm:fm-feat-dead" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_TMUX_MISSING=0 # the target still resolves, exactly the reported symptom
+  local gen; gen=$("$ROOT/bin/fm-busy-event.sh" arm "$d/state" feat-dead)
+  # No turn-end hook ever fires for this incarnation: age the seeded record
+  # far past the bound with no other change, exactly what a died-at-launch
+  # crew leaves behind.
+  printf 'v1 gen=%s seq=1 state=busy source=fm-spawn event=launch-brief ts=%s\n' \
+    "$gen" "$(( $(date +%s) - 1 ))" > "$d/state/feat-dead.busy-state"
+  local out
+  out=$(PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" FM_BUSY_SPAWN_MAX_SECS=1 \
+    "$CREW_STATE" feat-dead)
+  assert_not_contains "$out" "state: working" \
+    "an expired unconfirmed fm-spawn seed must not report working forever"
+  assert_contains "$out" "fm-spawn-expired" "the expired seed is named in the detail"
+  pass "an expired fm-spawn seed with no confirming turn-end hook does not read working forever"
+}
+
+# A fresh fm-spawn seed - the normal state of every real crew before its
+# first turn-end hook fires - must still read working: the expiry must never
+# weaken genuine busy detection for an actually-alive, actually-working crew.
+test_no_run_fresh_spawn_seed_still_working() {
+  reset_fakes
+  local d; d=$(new_case fresh-spawn)
+  make_repo_on_branch "$d/wt" fm/feat-fresh
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-fresh.meta" "window=fm:fm-feat-fresh" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_RUNS_LIST=""
+  "$ROOT/bin/fm-busy-event.sh" arm "$d/state" feat-fresh >/dev/null
+  local out; out=$(run_crew_state "$d" feat-fresh)
+  assert_contains "$out" "state: working" "a fresh fm-spawn seed still reads working"
+  assert_contains "$out" "fm-spawn" "the working verdict names the fm-spawn source"
+  pass "a fresh fm-spawn seed with no hook fired yet still reads working (not weakened)"
+}
+
 # A converted adapter must NOT read working from rendered footer text: the
 # redesign removed that dependency, so a pane painting "esc to interrupt" with
 # no semantic record is unknown, never working and never silently idle.
@@ -1573,6 +1621,8 @@ test_cross_branch_attribution_picks_most_recent_row
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status
 test_other_branch_run_ignored
 test_no_run_busy_pane
+test_no_run_expired_spawn_seed_not_working_forever
+test_no_run_fresh_spawn_seed_still_working
 test_no_run_footer_text_alone_is_not_working
 test_no_run_grok_uses_isolated_fallback
 test_no_run_herdr_unknown_uses_backend_capture

@@ -375,6 +375,40 @@ test_dead_endpoint_overrides() {
   pass "endpoint death is the only process-level override and yields dead, never busy"
 }
 
+# Regression: a crewmate that dies at or before its first turn-end hook never
+# gets a second event written on top of the fm-spawn seed - no other writer
+# could ever clear it - so before this fix the seed alone reported busy
+# forever. Past FM_BUSY_SPAWN_MAX_SECS the seed no longer proves busy on its
+# own; the endpoint is then cross-checked, and only a confirmed-gone endpoint
+# classifies dead.
+test_expired_spawn_seed_not_busy_forever() {
+  local state gen out
+  state=$(new_state_dir expired-spawn)
+  gen=$("$EV" arm "$state" t1)
+  # No turn-end hook has ever fired for this incarnation: rewrite the seeded
+  # record with an aged ts and no other change, exactly what a died-at-launch
+  # crew leaves behind.
+  printf 'v1 gen=%s seq=1 state=busy source=fm-spawn event=launch-brief ts=%s\n' \
+    "$gen" "$(( $(date +%s) - 1 ))" > "$state/t1.busy-state"
+  out=$(FM_BUSY_SPAWN_MAX_SECS=1 fm_busy_classify tmux w1 claude t1 "$state")
+  [ "$out" = "unknown fm-spawn-expired" ] \
+    || fail "an expired unconfirmed fm-spawn seed must not stay busy forever, got '$out'"
+  # A confirmed-gone endpoint on top of an expired seed classifies dead - the
+  # strongest available signal wins over the merely-expired verdict.
+  # shellcheck disable=SC2329 # invoked indirectly through fm_busy_classify
+  fm_backend_target_exists() { return 1; }
+  out=$(FM_BUSY_SPAWN_MAX_SECS=1 fm_busy_classify tmux w1 claude t1 "$state")
+  [ "$out" = "dead endpoint-gone" ] \
+    || fail "an expired seed whose endpoint is confirmed gone must classify dead, got '$out'"
+  unset -f fm_backend_target_exists
+  # A record still within the bound is the normal case for every real crew in
+  # its first turn and must be unaffected: never weaken genuine busy detection.
+  out=$(FM_BUSY_SPAWN_MAX_SECS=999999 fm_busy_classify tmux w1 claude t1 "$state")
+  [ "$out" = "busy fm-spawn" ] \
+    || fail "a fresh fm-spawn seed within the bound must still classify busy, got '$out'"
+  pass "an unconfirmed fm-spawn seed expires instead of classifying busy forever"
+}
+
 test_herdr_native_busy_only() {
   local state out
   state=$(new_state_dir herdr-native)
@@ -458,6 +492,7 @@ test_codex_unverified_gate
 test_kimi_unverified_gate
 test_cursor_ignores_rendered_and_native_signals
 test_dead_endpoint_overrides
+test_expired_spawn_seed_not_busy_forever
 test_herdr_native_busy_only
 test_record_read_leaves_caller_shell_intact
 test_boolean_view_never_promotes_unknown

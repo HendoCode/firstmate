@@ -41,13 +41,21 @@
 # Classifier-only sources (never written into a record):
 #   endpoint-gone, herdr-native, grok-regex, muse-session-log,
 #   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
-#   kimi-unverified, codex-unverified, capture-failed, no-target
+#   kimi-unverified, codex-unverified, capture-failed, no-target,
+#   fm-spawn-expired
 #
 # Classification (fm_busy_classify): busy | idle | unknown | dead, always
 # with the producing source as the second token. Precedence:
 #   1. dead endpoint (fm_busy_classify_live only) -> dead endpoint-gone
 #   2. standalone Kimi before verification       -> unknown kimi-unverified
-#   3. a valid, gen-matching, source-trusted record -> its state and source
+#   3. a valid, gen-matching, source-trusted record -> its state and source,
+#      EXCEPT an unconfirmed fm-spawn busy record (no turn-end hook has EVER
+#      fired for this incarnation) older than FM_BUSY_SPAWN_MAX_SECS: nothing
+#      else could ever clear a crew that died at or before its first turn, so
+#      past that bound the seed alone no longer proves busy. The endpoint is
+#      cross-checked when fm_backend_target_exists is available: gone
+#      classifies dead endpoint-gone, still present classifies unknown
+#      fm-spawn-expired. See fm_busy_spawn_record_expired.
 #   4. no record at all: herdr's native busy verdict is trusted as busy
 #      (generation state is sufficient for busy, not for idle), then the
 #      muse session-log and cursor transcript pull sources, then the Grok-only
@@ -146,6 +154,31 @@ fm_busy_codex_semantic_source() {
   fm_busy_codex_appserver_observable || fm_busy_codex_hooks_verified
 }
 
+# How long an unconfirmed fm-spawn busy record (the launch-brief turn seeded
+# at arm time, before any turn-end hook has ever fired for this incarnation)
+# may be trusted as busy. fm-spawn is the one firstmate-owned source with no
+# clearing writer of its own: a crew that dies at or before its first turn
+# leaves this exact record in place forever, so without a bound it reports
+# busy indefinitely and no staleness check ever fires because the crew reads
+# as provably working. Generously above any legitimate first turn, including
+# a long tool call, build, or test run - mirrors bin/fm-watch.sh's
+# BUSY_TURN_MAX_SECS bound, kept separate because it guards a different
+# concern (trusting an unconfirmed seed here vs. escalating a proven-busy
+# wedge there).
+FM_BUSY_SPAWN_MAX_SECS_DEFAULT=3600
+
+# fm_busy_spawn_record_expired: 0 iff <ts> (the record's own recorded epoch
+# second) is older than the configured bound. An unreadable or non-numeric ts
+# never invents staleness.
+fm_busy_spawn_record_expired() {  # <ts>
+  local ts=${1:-} now bound
+  case "$ts" in ''|*[!0-9]*) return 1 ;; esac
+  bound=${FM_BUSY_SPAWN_MAX_SECS:-$FM_BUSY_SPAWN_MAX_SECS_DEFAULT}
+  case "$bound" in ''|*[!0-9]*) bound=$FM_BUSY_SPAWN_MAX_SECS_DEFAULT ;; esac
+  now=$(date +%s)
+  [ $((now - ts)) -ge "$bound" ]
+}
+
 fm_busy_record_path() {  # <state-dir> <id>
   printf '%s/%s.busy-state' "$1" "$2"
 }
@@ -211,8 +244,10 @@ fm_busy_source_trusted() {  # <harness> <source>
 }
 
 # fm_busy_record_read: parse and validate state/<id>.busy-state against the
-# armed gen. Prints "<state> <source> <event> <seq>" for a valid record.
-# Non-zero returns name the reason on stdout instead:
+# armed gen. Prints "<state> <source> <event> <seq> <ts>" for a valid record
+# (ts is the record's own recorded epoch second, consulted by fm_busy_classify
+# to expire an unconfirmed fm-spawn seed). Non-zero returns name the reason
+# on stdout instead:
 #   missing      no record file (or no armed gen and no record)
 #   malformed    unparseable line, bad tokens, or a missing armed gen for an
 #                existing record
@@ -262,7 +297,7 @@ fm_busy_record_read() {  # <state-dir> <id>
     printf 'gen-mismatch'
     return 1
   fi
-  printf '%s %s %s %s' "$r_state" "$r_source" "$r_event" "$r_seq"
+  printf '%s %s %s %s %s' "$r_state" "$r_source" "$r_event" "$r_seq" "$r_ts"
 }
 
 # ---------------------------------------------------------------------------
@@ -839,7 +874,7 @@ fm_busy_grok_tail_busy() {
 # if available, else reports unknown capture-failed.
 fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
   local backend=$1 target=$2 harness=$3 id=$4 state=$5 tail40=${6-}
-  local out rc r_state r_source native log
+  local out rc r_state r_source r_ts native log
   case "$harness" in
     kimi*)
       if ! fm_busy_kimi_verified; then
@@ -877,8 +912,26 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
     r_state=${out%% *}
     out=${out#* }
     r_source=${out%% *}
+    out=${out#* }                # drop source, leaving "event seq ts"
+    out=${out#* }                # drop event, leaving "seq ts"
+    r_ts=${out#* }                # drop seq, leaving ts
     if fm_busy_source_trusted "$harness" "$r_source"; then
-      printf '%s %s' "$r_state" "$r_source"
+      if [ "$r_state" = busy ] && [ "$r_source" = fm-spawn ] \
+        && fm_busy_spawn_record_expired "$r_ts"; then
+        # No turn-end hook has ever fired for this incarnation, and the seed
+        # is now old enough that it no longer proves the crew is working (see
+        # FM_BUSY_SPAWN_MAX_SECS above). Cross-check the endpoint before
+        # falling through to unknown, so a confirmed-gone pane reports dead
+        # rather than an indefinite busy.
+        if command -v fm_backend_target_exists >/dev/null 2>&1 \
+          && ! fm_backend_target_exists "$backend" "$target" 2>/dev/null; then
+          printf 'dead endpoint-gone'
+        else
+          printf 'unknown fm-spawn-expired'
+        fi
+      else
+        printf '%s %s' "$r_state" "$r_source"
+      fi
     else
       printf 'unknown source-mismatch'
     fi

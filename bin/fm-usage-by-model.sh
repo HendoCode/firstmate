@@ -7,6 +7,9 @@
 # Rates: reuse data/usage-rates.json if present (relative to repo root), else built-in Anthropic/OpenAI/xAI.
 # Flags: --json (default), --csv, --today, --since YYYY-MM-DD, --help.
 # Read-only on all sources; absent source -> zero contrib, never fail.
+# A source that exists but fails to read/parse (corrupt db, unreadable file)
+# reports a warning (stderr + JSON "warnings") instead of silently looking absent.
+# Source paths overridable for testing via FM_USAGE_OPENCODE_DB / FM_USAGE_CLAUDE_GLOB.
 # shellcheck shell=bash
 
 set -euo pipefail
@@ -52,6 +55,7 @@ from pathlib import Path
 
 mode, since, rates_file = sys.argv[1], sys.argv[2], sys.argv[3]
 since_date = since or ""
+warnings = []
 
 # rates
 rates = {
@@ -99,7 +103,7 @@ def day_bucket(ts):
 agg = defaultdict(lambda: {"turns":0, "input":0, "output":0, "cache_read":0, "cache_write":0, "note":""})
 
 # opencode source
-oc_db = os.path.expanduser("~/.local/share/opencode/opencode.db")
+oc_db = os.path.expanduser(os.environ.get("FM_USAGE_OPENCODE_DB", "~/.local/share/opencode/opencode.db"))
 if os.path.exists(oc_db):
   try:
     con = sqlite3.connect(oc_db)
@@ -108,26 +112,28 @@ if os.path.exists(oc_db):
       ts, data = row
       try:
         d = json.loads(data)
+        if d.get("role") != "assistant": continue
         prov = d.get("providerID") or "unknown"
         mdl = d.get("modelID") or "unknown"
         toks = d.get("tokens") or {}
+        cache = toks.get("cache") or {}
         day = day_bucket(ts)
         if since_date and day < since_date: continue
         key = (day, "opencode", prov, mdl)
         agg[key]["turns"] += 1
         agg[key]["input"] += toks.get("input",0) or 0
         agg[key]["output"] += toks.get("output",0) or 0
-        agg[key]["cache_read"] += toks.get("cache.read",0) or 0
-        agg[key]["cache_write"] += toks.get("cache.write",0) or 0
+        agg[key]["cache_read"] += cache.get("read",0) or 0
+        agg[key]["cache_write"] += cache.get("write",0) or 0
         agg[key]["note"] = ""
       except Exception:
         continue
     con.close()
-  except Exception:
-    pass
+  except Exception as e:
+    warnings.append(f"opencode: unreadable ({oc_db}): {e}")
 
 # claude-code source
-cc_glob = os.path.expanduser("~/.claude/projects/**/*.jsonl")
+cc_glob = os.path.expanduser(os.environ.get("FM_USAGE_CLAUDE_GLOB", "~/.claude/projects/**/*.jsonl"))
 for jf in glob.glob(cc_glob, recursive=True):
   try:
     with open(jf) as f:
@@ -153,8 +159,8 @@ for jf in glob.glob(cc_glob, recursive=True):
           agg[key]["note"] = "list-price estimate"
         except Exception:
           continue
-  except Exception:
-    pass
+  except Exception as e:
+    warnings.append(f"claude-code: unreadable ({jf}): {e}")
 
 # build rows
 rows = []
@@ -168,6 +174,9 @@ for (day, src, prov, mdl), v in sorted(agg.items()):
     "cache_read_tokens": cr, "cache_write_tokens": cw,
     "est_cost_usd": round(cost, 4), "note": v["note"]
   })
+
+for w in warnings:
+  print(f"warning: {w}", file=sys.stderr)
 
 if mode == "csv":
   print("date,source,provider,model,turns,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,est_cost_usd,note")
@@ -187,5 +196,5 @@ else:
     for k in ["turns","input_tokens","output_tokens","cache_read_tokens","cache_write_tokens"]:
       total[k] += r[k]
     total["est_cost_usd"] = round(total["est_cost_usd"] + r["est_cost_usd"],4)
-  print(json.dumps({"models": list(models.values()), "total": total, "query_time": datetime.datetime.now(datetime.timezone.utc).isoformat(), "sources": ["opencode","claude-code"], "pi_note": "no local per-turn token log found"}, indent=2))
+  print(json.dumps({"models": list(models.values()), "total": total, "query_time": datetime.datetime.now(datetime.timezone.utc).isoformat(), "sources": ["opencode","claude-code"], "pi_note": "no local per-turn token log found", "warnings": warnings}, indent=2))
 PYEOF

@@ -1,216 +1,191 @@
 #!/usr/bin/env bash
+# fm-usage-by-model.sh
+# Aggregate token usage across local harness sources (opencode, claude-code).
+# Pi: no local per-turn token artifact found in ~/.pi (investigated 2026-08-27); omitted without silent drop.
+# Output: preserves legacy JSON (models[]/total/query_time); adds --csv, --today/--since, multi-source grouping.
+# note field: "list-price estimate" for Claude Code (corporate contract, not list); blank or "billed" for others when authoritative.
+# Rates: reuse data/usage-rates.json if present (relative to repo root), else built-in Anthropic/OpenAI/xAI.
+# Flags: --json (default), --csv, --today, --since YYYY-MM-DD, --help.
+# Read-only on all sources; absent source -> zero contrib, never fail.
+# shellcheck shell=bash
+
 set -euo pipefail
 
-DISPLAY_HELP_AND_EXIT=
-while getopts "h" opt; do
-    case "${opt}" in
-        h) DISPLAY_HELP_AND_EXIT=1 ;;
-        *) exit 1 ;;
-    esac
-done
-shift $((OPTIND - 1))
-
-if [[ -n "${DISPLAY_HELP_AND_EXIT:-}" ]]; then
-    cat << 'EOF'
-fm-usage-by-model.sh - Query opencode.db for per-provider/model usage statistics
-
-USAGE:
-    fm-usage-by-model.sh [OPTIONS]
-
-OPTIONS:
-    -h    Show this help message
-
-DESCRIPTION:
-    Queries the opencode SQLite database to extract per-provider/model usage metrics
-    including input/output tokens, cache read/write, turns count, and estimated costs.
-    Groups by provider+model since pricing differs by provider (e.g., xai/grok vs amazon-bedrock/grok).
-
-OUTPUT:
-    JSON object with:
-      - models: array of per-provider/model breakdowns
-      - total: aggregate totals across all models
-      - query_time: timestamp of the query
-
-DATABASE:
-    Default: ~/.local/share/opencode/opencode.db
-    Override: OPENCODE_DB_PATH environment variable
-
-PRICING:
-    Rates loaded from data/usage-rates.json relative to script directory.
-
-EXAMPLES:
-    fm-usage-by-model.sh
-    fm-usage-by-model.sh 2>/dev/null | jq '.total'
-EOF
-    exit 0
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RATES_FILE="${SCRIPT_DIR}/../data/usage-rates.json"
-DB_PATH="${OPENCODE_DB_PATH:-$HOME/.local/share/opencode/opencode.db}"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RATES_FILE="${REPO_ROOT}/data/usage-rates.json"
 
-if [[ ! -f "${DB_PATH}" ]]; then
-    echo '{"error": "database not found", "path": "'"${DB_PATH}"'"}' >&2
-    exit 1
-fi
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--json|--csv] [--today|--since YYYY-MM-DD] [--help]
 
-if [[ ! -f "${RATES_FILE}" ]]; then
-    echo '{"error": "rates file not found", "path": "'"${RATES_FILE}"'"}' >&2
-    exit 1
-fi
+Aggregates per-message token usage from local harness stores.
+Sources: opencode (SQLite ~/.local/share/opencode/opencode.db), claude-code (JSONL ~/.claude/projects/**/*.jsonl).
+Pi source: none (no local artifact).
 
-if ! command -v sqlite3 >/dev/null 2>&1; then
-    echo '{"error": "sqlite3 not found"}' >&2
-    exit 1
-fi
-
-sqlite3 -separator $'\t' "${DB_PATH}" "
-SELECT 
-    json_extract(data, '$.providerID') as provider,
-    json_extract(data, '$.modelID') as model,
-    SUM(CAST(json_extract(data, '$.tokens.input') AS INTEGER)) as input,
-    SUM(CAST(json_extract(data, '$.tokens.output') AS INTEGER)) as output,
-    SUM(CAST(CASE WHEN json_extract(data, '$.tokens.cache.read') IS NULL THEN 0 ELSE json_extract(data, '$.tokens.cache.read') END AS INTEGER)) as cache_read,
-    SUM(CAST(CASE WHEN json_extract(data, '$.tokens.cache.write') IS NULL THEN 0 ELSE json_extract(data, '$.tokens.cache.write') END AS INTEGER)) as cache_write,
-    COUNT(*) as turns
-FROM message 
-WHERE json_extract(data, '$.role') = 'assistant'
-  AND json_extract(data, '$.modelID') IS NOT NULL
-GROUP BY json_extract(data, '$.providerID'), json_extract(data, '$.modelID')
-ORDER BY turns DESC
-" | python3 -c "
-import json
-import sys
-from datetime import datetime, timezone
-
-rates_json = open('${RATES_FILE}').read()
-rates = json.loads(rates_json)
-
-results = []
-total_input = 0
-total_output = 0
-total_cache_read = 0
-total_cache_write = 0
-total_turns = 0
-total_cost = 0.0
-
-def get_rate(provider, model, rate_type):
-    provider_lower = provider.lower()
-    model_lower = model.lower()
-    
-    # Map provider+model to rate entries
-    # Normalize model names
-    if 'claude-opus' in model_lower:
-        model_key = 'claude-opus-5' if '5' in model_lower else 'claude-opus-4'
-    elif 'claude-sonnet' in model_lower:
-        model_key = 'claude-sonnet-5' if '5' in model_lower else 'claude-sonnet-4'
-    elif 'claude-haiku' in model_lower:
-        model_key = 'claude-haiku-4'
-    elif 'gpt-5' in model_lower:
-        model_key = 'gpt-5'
-    elif 'gpt-4' in model_lower:
-        model_key = 'gpt-4o'
-    elif 'grok' in model_lower:
-        if '5' in model_lower:
-            model_key = 'grok-5'
-        elif 'build' in model_lower:
-            model_key = 'grok-4'  # build variants use base pricing
-        else:
-            model_key = 'grok-4'
-    elif 'deepseek' in model_lower:
-        model_key = 'v3'
-    elif 'nemotron' in model_lower:
-        if 'super' in model_lower or '120b' in model_lower:
-            model_key = 'nemotron-super'
-        elif 'nano' in model_lower or '30b' in model_lower:
-            model_key = 'nemotron-nano'
-        else:
-            model_key = 'nemotron'
-    elif 'glm' in model_lower:
-        model_key = 'glm-5' if '5' in model_lower else 'glm'
-    elif 'big-pickle' in model_lower:
-        model_key = 'big-pickle'
-    else:
-        return rates.get('fallback', {}).get(rate_type, 0.0)
-    
-    try:
-        return rates['rates'][provider_lower][model_key].get(rate_type, 0.0)
-    except (KeyError, TypeError):
-        # Provider might not be in rates, fallback
-        pass
-    
-    # Try to find model rate in any provider that has it
-    for prov_category in rates['rates'].values():
-        if model_key in prov_category:
-            return prov_category[model_key].get(rate_type, 0.0)
-    
-    return rates.get('fallback', {}).get(rate_type, 0.0)
-
-for line in sys.stdin:
-    parts = line.strip().split('\t')
-    if len(parts) != 7:
-        continue
-    
-    provider = parts[0] or 'unknown'
-    model = parts[1]
-    input_tokens = int(parts[2]) if parts[2] else 0
-    output_tokens = int(parts[3]) if parts[3] else 0
-    cache_read = int(parts[4]) if parts[4] else 0
-    cache_write = int(parts[5]) if parts[5] else 0
-    turns = int(parts[6]) if parts[6] else 0
-    
-    input_rate = get_rate(provider, model, 'input')
-    output_rate = get_rate(provider, model, 'output')
-    cache_read_rate = get_rate(provider, model, 'cache_read')
-    cache_write_rate = get_rate(provider, model, 'cache_write')
-    
-    cost = 0.0
-    cost += (input_tokens / 1_000_000) * input_rate
-    cost += (output_tokens / 1_000_000) * output_rate
-    cost += (cache_read / 1_000_000) * cache_read_rate
-    cost += (cache_write / 1_000_000) * cache_write_rate
-    
-    results.append({
-        'provider': provider,
-        'model': model,
-        'tokens': {
-            'input': input_tokens,
-            'output': output_tokens,
-            'cache_read': cache_read,
-            'cache_write': cache_write
-        },
-        'turns': turns,
-        'estimated_cost_usd': round(cost, 6),
-        'rates_used': {
-            'input_per_million': input_rate,
-            'output_per_million': output_rate,
-            'cache_read_per_million': cache_read_rate,
-            'cache_write_per_million': cache_write_rate
-        }
-    })
-    
-    total_input += input_tokens
-    total_output += output_tokens
-    total_cache_read += cache_read
-    total_cache_write += cache_write
-    total_turns += turns
-    total_cost += cost
-
-output = {
-    'models': results,
-    'total': {
-        'tokens': {
-            'input': total_input,
-            'output': total_output,
-            'cache_read': total_cache_read,
-            'cache_write': total_cache_write
-        },
-        'turns': total_turns,
-        'estimated_cost_usd': round(total_cost, 6)
-    },
-    'query_time': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-    'database': '${DB_PATH}'
+Output groups by (date, source, provider, model) with turns, tokens, est_cost_usd, note.
+--json: legacy shape {models:[], total:{}, query_time} for backward compat (jq '.total' etc).
+--csv: date,source,provider,model,turns,input_tokens,... ,est_cost_usd,note (matches prior ad-hoc CSV).
+--today: equivalent to --since $(date +%Y-%m-%d)
+--since: filter to date >= YYYY-MM-DD (UTC day bucket from timestamps).
+Absent sources report zero; never error.
+EOF
 }
 
-print(json.dumps(output, indent=2))
-"
+MODE=json
+SINCE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) MODE=json; shift ;;
+    --csv) MODE=csv; shift ;;
+    --today) SINCE="$(date +%Y-%m-%d)"; shift ;;
+    --since) SINCE="$2"; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+python3 - "$MODE" "$SINCE" "$RATES_FILE" <<'PYEOF'
+import json, sqlite3, os, sys, glob, datetime, re
+from collections import defaultdict
+from pathlib import Path
+
+mode, since, rates_file = sys.argv[1], sys.argv[2], sys.argv[3]
+since_date = since or ""
+
+# rates
+rates = {
+  "anthropic": {
+    "claude-3-5-sonnet": (3,15,0,0),
+    "claude-opus-4": (15,75,0,0),
+    "claude-sonnet-4": (3,15,0,0),
+    "claude-sonnet-5": (3,15,0,0),
+    "claude-opus-4-8": (15,75,0,0),
+  },
+  "openai": {"gpt-4o": (2.5,10,0,0)},
+  "xai": {"grok-4": (5,15,0,0)},
+}
+if os.path.exists(rates_file):
+  try:
+    with open(rates_file) as f:
+      file_rates = json.load(f)
+      for prov, models in file_rates.items():
+        if prov not in rates: rates[prov] = {}
+        rates[prov].update(models)
+  except Exception:
+    pass
+
+def match_rate(provider, model):
+  p = provider.lower() if provider else ""
+  m = model.lower() if model else ""
+  if p in rates:
+    for key, val in rates[p].items():
+      if key in m or m in key:
+        return val
+  # generous substring
+  for prov, md in rates.items():
+    for key, val in md.items():
+      if key in m:
+        return val
+  return (0,0,0,0) # unknown -> 0 cost
+
+def day_bucket(ts):
+  if isinstance(ts, (int, float)):
+    dt = datetime.datetime.fromtimestamp(ts/1000, tz=datetime.timezone.utc)
+  else:
+    dt = datetime.datetime.fromisoformat(ts.replace('Z','+00:00'))
+  return dt.date().isoformat()
+
+agg = defaultdict(lambda: {"turns":0, "input":0, "output":0, "cache_read":0, "cache_write":0, "note":""})
+
+# opencode source
+oc_db = os.path.expanduser("~/.local/share/opencode/opencode.db")
+if os.path.exists(oc_db):
+  try:
+    con = sqlite3.connect(oc_db)
+    cur = con.cursor()
+    for row in cur.execute("SELECT time_created, data FROM message WHERE data IS NOT NULL"):
+      ts, data = row
+      try:
+        d = json.loads(data)
+        prov = d.get("providerID") or "unknown"
+        mdl = d.get("modelID") or "unknown"
+        toks = d.get("tokens") or {}
+        day = day_bucket(ts)
+        if since_date and day < since_date: continue
+        key = (day, "opencode", prov, mdl)
+        agg[key]["turns"] += 1
+        agg[key]["input"] += toks.get("input",0) or 0
+        agg[key]["output"] += toks.get("output",0) or 0
+        agg[key]["cache_read"] += toks.get("cache.read",0) or 0
+        agg[key]["cache_write"] += toks.get("cache.write",0) or 0
+        agg[key]["note"] = ""
+      except Exception:
+        continue
+    con.close()
+  except Exception:
+    pass
+
+# claude-code source
+cc_glob = os.path.expanduser("~/.claude/projects/**/*.jsonl")
+for jf in glob.glob(cc_glob, recursive=True):
+  try:
+    with open(jf) as f:
+      for line in f:
+        if not line.strip(): continue
+        try:
+          obj = json.loads(line)
+          msg = obj.get("message") or {}
+          if msg.get("role") != "assistant": continue
+          model = msg.get("model") or ""
+          if not model or model == "<synthetic>": continue
+          usage = msg.get("usage") or {}
+          ts = obj.get("timestamp") or ""
+          day = day_bucket(ts)
+          if since_date and day < since_date: continue
+          prov = "anthropic"
+          key = (day, "claude-code", prov, model)
+          agg[key]["turns"] += 1
+          agg[key]["input"] += usage.get("input_tokens",0) or 0
+          agg[key]["output"] += usage.get("output_tokens",0) or 0
+          agg[key]["cache_read"] += usage.get("cache_read_input_tokens",0) or 0
+          agg[key]["cache_write"] += usage.get("cache_creation_input_tokens",0) or 0
+          agg[key]["note"] = "list-price estimate"
+        except Exception:
+          continue
+  except Exception:
+    pass
+
+# build rows
+rows = []
+for (day, src, prov, mdl), v in sorted(agg.items()):
+  inp, out, cr, cw = v["input"], v["output"], v["cache_read"], v["cache_write"]
+  ir, or_, _, _ = match_rate(prov, mdl)
+  cost = (inp * ir + out * or_) / 1_000_000.0
+  rows.append({
+    "date": day, "source": src, "provider": prov, "model": mdl,
+    "turns": v["turns"], "input_tokens": inp, "output_tokens": out,
+    "cache_read_tokens": cr, "cache_write_tokens": cw,
+    "est_cost_usd": round(cost, 4), "note": v["note"]
+  })
+
+if mode == "csv":
+  print("date,source,provider,model,turns,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,est_cost_usd,note")
+  for r in rows:
+    print(",".join(str(r[k]) for k in ["date","source","provider","model","turns","input_tokens","output_tokens","cache_read_tokens","cache_write_tokens","est_cost_usd","note"]))
+else:
+  # legacy json shape + extra day/source breakdown
+  models = {}
+  total = {"turns":0,"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"est_cost_usd":0}
+  for r in rows:
+    mk = f"{r['provider']}:{r['model']}"
+    if mk not in models:
+      models[mk] = {"provider":r['provider'],"model":r['model'],"turns":0,"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"est_cost_usd":0,"note":r['note']}
+    for k in ["turns","input_tokens","output_tokens","cache_read_tokens","cache_write_tokens"]:
+      models[mk][k] += r[k]
+    models[mk]["est_cost_usd"] = round(models[mk]["est_cost_usd"] + r["est_cost_usd"],4)
+    for k in ["turns","input_tokens","output_tokens","cache_read_tokens","cache_write_tokens"]:
+      total[k] += r[k]
+    total["est_cost_usd"] = round(total["est_cost_usd"] + r["est_cost_usd"],4)
+  print(json.dumps({"models": list(models.values()), "total": total, "query_time": datetime.datetime.now(datetime.timezone.utc).isoformat(), "sources": ["opencode","claude-code"], "pi_note": "no local per-turn token log found"}, indent=2))
+PYEOF

@@ -27,12 +27,20 @@ cat > "$CC_DIR/session.jsonl" <<'JSONL'
 {"timestamp":"2024-08-28T00:01:00Z","message":{"role":"assistant","model":"<synthetic>","usage":{"input_tokens":10}}}
 JSONL
 
-# run with env overrides (script hardcodes paths, so we patch temporarily? use --since to filter; for test we monkey the paths via env or accept that real run uses user dirs - instead test CLI flags and json/csv output shape)
-# Since script paths are hardcoded, test focuses on flag parsing, legacy shape, csv output, --today/--since, and graceful absent source.
-OUT_JSON="$("$BIN_DIR/fm-usage-by-model.sh" --json --since 2024-08-28 2>/dev/null || true)"
-echo "$OUT_JSON" | jq -e '.total and .models and .pi_note' >/dev/null || { echo "legacy json shape failed"; exit 1; }
+# synthetic pi jsonl (2 lines, one usage-bearing, one non-usage to test skip)
+PI_DIR="$TEST_DIR/.pi/agent/sessions/p1"
+mkdir -p "$PI_DIR"
+cat > "$PI_DIR/session.jsonl" <<'JSONL'
+{"type":"message","timestamp":"2024-08-28T00:00:00Z","message":{"role":"assistant","model":"claude-sonnet-4-6","provider":"anthropic","usage":{"input":3,"output":752,"cacheRead":0,"cacheWrite":42889,"totalTokens":43644,"cost":{"input":0.000009,"output":0.01128,"cacheRead":0,"cacheWrite":0.16083375,"total":0.17212275},"cacheWrite1h":0,"reasoning":671}}}
+{"type":"thinking","timestamp":"2024-08-28T00:00:01Z","message":{}}
+JSONL
 
-OUT_CSV="$("$BIN_DIR/fm-usage-by-model.sh" --csv --today 2>/dev/null || true)"
+# run with env overrides for pi path (opencode/claude hardcode user paths but test filters by --since; pi now respects PI_SESSIONS_DIR)
+OUT_JSON=$(PI_SESSIONS_DIR="$PI_DIR" "$BIN_DIR/fm-usage-by-model.sh" --json --since 2024-08-28 2>/dev/null || true)
+echo "$OUT_JSON" | jq -e '.total and .models and (.sources | index("pi"))' >/dev/null || { echo "legacy json shape failed"; exit 1; }
+
+OUT_CSV=$(PI_SESSIONS_DIR="$PI_DIR" "$BIN_DIR/fm-usage-by-model.sh" --csv --since 2024-08-28 2>/dev/null || true)
 echo "$OUT_CSV" | head -1 | grep -q 'date,source,provider,model,turns' || { echo "csv header failed"; exit 1; }
+echo "$OUT_CSV" | grep -q 'pi,anthropic,claude-sonnet-4-6.*pi-computed cost' || { echo "pi row missing or wrong"; exit 1; }
 
 echo "PASS: fm-usage-by-model.test.sh"

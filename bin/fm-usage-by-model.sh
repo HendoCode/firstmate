@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # fm-usage-by-model.sh
-# Aggregate token usage across local harness sources (opencode, claude-code).
-# Pi: no local per-turn token artifact found in ~/.pi (investigated 2026-08-27); omitted without silent drop.
+# Aggregate token usage across local harness sources (opencode, claude-code, pi).
 # Output: preserves legacy JSON (models[]/total/query_time); adds --csv, --today/--since, multi-source grouping.
-# note field: "list-price estimate" for Claude Code (corporate contract, not list); blank or "billed" for others when authoritative.
+# note field: "list-price estimate" for Claude Code (corporate contract, not list); "pi-computed cost" for Pi (uses Pi's own pre-computed value, not re-derived from our rates table); blank or "billed" for others when authoritative.
 # Rates: reuse data/usage-rates.json if present (relative to repo root), else built-in Anthropic/OpenAI/xAI.
 # Flags: --json (default), --csv, --today, --since YYYY-MM-DD, --help.
 # Read-only on all sources; absent source -> zero contrib, never fail.
@@ -14,14 +13,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RATES_FILE="${REPO_ROOT}/data/usage-rates.json"
+PI_SESSIONS_DIR="${PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [--json|--csv] [--today|--since YYYY-MM-DD] [--help]
 
 Aggregates per-message token usage from local harness stores.
-Sources: opencode (SQLite ~/.local/share/opencode/opencode.db), claude-code (JSONL ~/.claude/projects/**/*.jsonl).
-Pi source: none (no local artifact).
+Sources: opencode (SQLite ~/.local/share/opencode/opencode.db), claude-code (JSONL ~/.claude/projects/**/*.jsonl), pi (JSONL ~/.pi/agent/sessions/**/*.jsonl or PI_SESSIONS_DIR).
+Pi: cost is Pi's own pre-computed value from usage.cost.total, not re-derived from our rates table.
 
 Output groups by (date, source, provider, model) with turns, tokens, est_cost_usd, note.
 --json: legacy shape {models:[], total:{}, query_time} for backward compat (jq '.total' etc).
@@ -96,7 +96,7 @@ def day_bucket(ts):
     dt = datetime.datetime.fromisoformat(ts.replace('Z','+00:00'))
   return dt.date().isoformat()
 
-agg = defaultdict(lambda: {"turns":0, "input":0, "output":0, "cache_read":0, "cache_write":0, "note":""})
+agg = defaultdict(lambda: {"turns":0, "input":0, "output":0, "cache_read":0, "cache_write":0, "note":"", "pre_cost":0.0})
 
 # opencode source
 oc_db = os.path.expanduser("~/.local/share/opencode/opencode.db")
@@ -156,12 +156,49 @@ for jf in glob.glob(cc_glob, recursive=True):
   except Exception:
     pass
 
+# pi source (PI_SESSIONS_DIR or ~/.pi/agent/sessions/**/*.jsonl); only message records with non-empty usage.cost
+pi_dir = os.environ.get("PI_SESSIONS_DIR", os.path.expanduser("~/.pi/agent/sessions"))
+if os.path.isdir(pi_dir):
+  pi_glob = os.path.join(pi_dir, "**", "*.jsonl")
+  for jf in glob.glob(pi_glob, recursive=True):
+    try:
+      with open(jf) as f:
+        for line in f:
+          if not line.strip(): continue
+          try:
+            obj = json.loads(line)
+            if obj.get("type") != "message": continue
+            msg = obj.get("message") or {}
+            usage = msg.get("usage") or {}
+            if not usage or not (usage.get("cost") or {}): continue
+            model = msg.get("model") or "unknown"
+            provider = msg.get("provider") or "unknown"
+            ts = obj.get("timestamp") or ""
+            day = day_bucket(ts)
+            if since_date and day < since_date: continue
+            key = (day, "pi", provider, model)
+            agg[key]["turns"] += 1
+            agg[key]["input"] += usage.get("input",0) or 0
+            agg[key]["output"] += usage.get("output",0) or 0
+            agg[key]["cache_read"] += usage.get("cacheRead",0) or 0
+            agg[key]["cache_write"] += usage.get("cacheWrite",0) or 0
+            c = (usage.get("cost") or {}).get("total", 0) or 0
+            agg[key]["pre_cost"] += c
+            agg[key]["note"] = "pi-computed cost"
+          except Exception:
+            continue
+    except Exception:
+      pass
+
 # build rows
 rows = []
 for (day, src, prov, mdl), v in sorted(agg.items()):
   inp, out, cr, cw = v["input"], v["output"], v["cache_read"], v["cache_write"]
-  ir, or_, _, _ = match_rate(prov, mdl)
-  cost = (inp * ir + out * or_) / 1_000_000.0
+  if src == "pi":
+    cost = v.get("pre_cost", 0.0)
+  else:
+    ir, or_, _, _ = match_rate(prov, mdl)
+    cost = (inp * ir + out * or_) / 1_000_000.0
   rows.append({
     "date": day, "source": src, "provider": prov, "model": mdl,
     "turns": v["turns"], "input_tokens": inp, "output_tokens": out,
@@ -187,5 +224,5 @@ else:
     for k in ["turns","input_tokens","output_tokens","cache_read_tokens","cache_write_tokens"]:
       total[k] += r[k]
     total["est_cost_usd"] = round(total["est_cost_usd"] + r["est_cost_usd"],4)
-  print(json.dumps({"models": list(models.values()), "total": total, "query_time": datetime.datetime.now(datetime.timezone.utc).isoformat(), "sources": ["opencode","claude-code"], "pi_note": "no local per-turn token log found"}, indent=2))
+  print(json.dumps({"models": list(models.values()), "total": total, "query_time": datetime.datetime.now(datetime.timezone.utc).isoformat(), "sources": ["opencode","claude-code","pi"]}, indent=2))
 PYEOF

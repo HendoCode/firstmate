@@ -874,7 +874,7 @@ fm_busy_grok_tail_busy() {
 # if available, else reports unknown capture-failed.
 fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
   local backend=$1 target=$2 harness=$3 id=$4 state=$5 tail40=${6-}
-  local out rc r_state r_source r_ts native log
+  local out rc r_state r_source r_ts native log agent_state
   case "$harness" in
     kimi*)
       if ! fm_busy_kimi_verified; then
@@ -930,6 +930,19 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
           printf 'unknown fm-spawn-expired'
         fi
       else
+        # A stale busy record survives a Herdr server restart that killed the
+        # agent, because the pane is restored by session-layout persistence but
+        # contains only a bare shell. Cross-check with the live agent state so
+        # a busy record is never trusted when the pane has no agent.
+        if [ "$r_state" = busy ] && [ "$backend" = herdr ] \
+          && command -v fm_backend_agent_state >/dev/null 2>&1; then
+          agent_state=$(fm_backend_agent_state "$backend" "$target" 2>/dev/null || true)
+          case "$agent_state" in
+            alive) ;;  # live agent confirms the busy record
+            dead|missing) printf 'unknown herdr-agent-gone'; return 0 ;;
+            # unreadable, unverified -> skip cross-check, trust the record
+          esac
+        fi
         printf '%s %s' "$r_state" "$r_source"
       fi
     else

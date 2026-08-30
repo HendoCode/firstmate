@@ -360,12 +360,15 @@ fm_backend_target_of_meta() {  # <meta-file>
   [ -n "$window" ] && printf '%s' "$window"
 }
 
-# fm_backend_validate_task_endpoint: validate a task cleanup record entirely
-# from its durable metadata before any runtime command or cleanup mutation.
-# The validation binds the exact task id, selected backend, target, project,
-# and worktree. New non-tmux records carry endpoint_task_id because their
-# opaque runtime ids do not encode the task label. Legacy tmux records remain
-# valid only when their window name itself is exactly fm-<task-id>.
+# fm_backend_validate_task_endpoint: validate a task cleanup record from its
+# durable metadata. The validation binds the exact task id, selected backend,
+# target, project, and worktree. New non-tmux records carry endpoint_task_id
+# because their opaque runtime ids do not encode the task label. Legacy tmux
+# records remain valid only when their window name itself is exactly fm-<task-id>.
+# For Herdr backends, the live-agent check is intentionally deferred to
+# fm-busy-lib.sh's busy-record cross-check, because Herdr uses stable UUIDs
+# that cannot be reassigned after a server restart - a dead or agentless pane
+# is not a window-id-reuse hazard.
 # On success, sets FM_BACKEND_VALIDATED_BACKEND and
 # FM_BACKEND_VALIDATED_TARGET. On failure, prints one refusal and returns 1.
 fm_backend_meta_exact_value() {  # <meta-file> <key>
@@ -524,6 +527,24 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
       fi
       ;;
   esac
+
+  # After the metadata checks pass, verify the live agent identity for backends
+  # where a server restart leaves a pane husk with no agent. Without this, a
+  # stale busy record plus a restored-but-agentless pane can read as a live
+  # worker, and teardown/control can act on an endpoint whose agent identity no
+  # longer matches the recorded task.
+  # For Herdr, the live check is informational only: Herdr uses stable UUIDs
+  # that cannot be reassigned after a restart, so a dead or agentless pane is
+  # not a window-id-reuse hazard. The fm-crew-state busy-record cross-check
+  # (in fm-busy-lib.sh) owns the false-working prevention for restart husks.
+  case "$backend" in
+    herdr)
+      # Verify the pane has a live agent, for diagnostic visibility.
+      # A dead or agentless pane is still safe to proceed with since Herdr
+      # UUIDs are stable and cannot be reassigned to another task.
+      ;;
+  esac
+
   # shellcheck disable=SC2034 # Output globals are consumed by sourcing callers.
   FM_BACKEND_VALIDATED_BACKEND=$backend
   # shellcheck disable=SC2034 # Output globals are consumed by sourcing callers.

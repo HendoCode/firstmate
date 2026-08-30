@@ -28,7 +28,12 @@
 #      gone/dead.
 #   2. Attribute an active or terminal no-mistakes run under the branch, head,
 #      pipeline-custody, and newest-first rules owned by bin/fm-nm-run-lib.sh.
-#      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
+#      A same-branch `axi status` answer is cross-checked against the newest-first
+#      `no-mistakes runs` list for that branch: if the list reports a different
+#      status, a newer run has superseded the one `axi status` returned and the
+#      list's status is authoritative, so a stale terminated run cannot shadow an
+#      active successor on the same branch. The run-step is AUTHORITATIVE once it
+#      is the current run: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
 #      the active step is ci, `axi status` alone cannot tell "still waiting on
@@ -346,7 +351,8 @@ nm_ci_checks_state() {
     *) printf 'unknown' ;;
   esac
 }
-# Coarse fallback for cross-branch attribution. `no-mistakes axi status` (bare)
+# Coarse fallback for cross-branch attribution AND for validating a same-branch
+# `axi status` answer against the current run. `no-mistakes axi status` (bare)
 # reports the active-or-most-recent run for the CURRENT branch when one
 # exists, else falls back to some other branch's run purely as informational
 # display (verified empirically: querying a worktree with its own active run
@@ -373,9 +379,10 @@ nm_ci_checks_state() {
 # "<status> <branch> <short-sha> <date> [<pr-url>]" separated by runs of
 # spaces (verified: no quoting, so splitting on the first two whitespace runs
 # is exact) - but branch + coarse status is exactly what this predicate needs:
-# is a run for THIS branch active right now. Echoes the first (most recent)
-# matching row's status word (running/completed/cancelled/failed), or empty
-# when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
+# is a run for THIS branch active right now, and whether the most recent run
+# for this branch matches the one `axi status` returned. Echoes the first (most
+# recent) matching row's status word (running/completed/cancelled/failed), or
+# empty when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
 nm_runs_status_for_branch() {  # <branch>
   local branch=$1 out row st rest br sha
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
@@ -440,26 +447,36 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
+    run_status=$(strip_quotes "$(nm_field status)")
+    # The runs list is newest-first and authoritative for which run on this
+    # branch is current. Query it whenever `axi status` answered so a same-
+    # branch answer that actually belongs to a superseded run can be detected
+    # and discarded. We deliberately skip this lookup when `axi status` timed
+    # out or returned empty: retrying the CLI immediately would just double
+    # the wait for no better answer.
+    COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
     # Head equality, or the pipeline-owned-active exemption: while the
     # pipeline owns this branch, the daemon's own branch attribution is
     # authoritative and the lane head need not be a git object here
     # (fm_nm_run_is_pipeline_owned_active in bin/fm-nm-run-lib.sh).
     if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] \
       && { nm_run_head_matches_worktree || fm_nm_run_is_pipeline_owned_active "$RUN_OUT"; }; then
-      HAVE_RUN=1
-    else
-      # The active-or-most-recent run is for another branch, or its same-branch
-      # attribution failed (the CLI is alive and answered) - try the coarse
-      # fallback.
-      # Deliberately nested inside `[ -n "$RUN_OUT" ]`: an empty/timed-out
-      # primary call means the CLI itself did not respond, so retrying it
-      # immediately with a second bounded call would just double the wait
-      # for no better answer.
-      COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
-      if [ -n "$COARSE_STATUS" ]; then
+      # A same-branch answer is only current if the runs list agrees on the
+      # branch's current status. A mismatch means `axi status` returned a
+      # superseded run (e.g. an earlier failed run when a later one is now
+      # active), so fall back to the coarse but current runs-list status.
+      if [ -n "$COARSE_STATUS" ] && [ "$COARSE_STATUS" != "$run_status" ]; then
         HAVE_RUN=1
         RUN_SOURCE=coarse
+      else
+        HAVE_RUN=1
       fi
+    elif [ -n "$COARSE_STATUS" ]; then
+      # The active-or-most-recent run is for another branch, or its same-branch
+      # attribution failed (the CLI is alive and answered) - use the coarse
+      # fallback when it found a current run for this branch.
+      HAVE_RUN=1
+      RUN_SOURCE=coarse
     fi
   fi
 fi
@@ -482,11 +499,11 @@ if [ "$HAVE_RUN" = 1 ]; then
     # status_span_first_actionable) regardless of this coarse-vs-full
     # distinction, so a real gate is never silently missed.
     case "$COARSE_STATUS" in
-      running)   RUN_STATE=working; RUN_DETAIL="validating (background run)" ;;
-      completed) RUN_STATE="done";  RUN_DETAIL="run completed" ;;
-      failed)    RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
-      cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
-      *)         RUN_STATE=unknown; RUN_DETAIL="runs list status: $COARSE_STATUS" ;;
+      running|fixing) RUN_STATE=working; RUN_DETAIL="validating (background run)" ;;
+      completed)      RUN_STATE="done";  RUN_DETAIL="run completed" ;;
+      failed)         RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
+      cancelled)      RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
+      *)              RUN_STATE=unknown; RUN_DETAIL="runs list status: $COARSE_STATUS" ;;
     esac
   else
     status=$(strip_quotes "$(nm_field status)")

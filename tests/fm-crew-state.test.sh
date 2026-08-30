@@ -14,12 +14,14 @@
 #   (c) genuine parked run + needs-decision log = NOT superseded  -> run-step
 #   (d) terminal run-step (passed/failed) is authoritative        -> run-step
 #   (e) cross-branch attribution: this branch's own run found via list lookup
-#   (f) no run + semantic busy                                    -> pane
-#   (g) no run + semantic idle falls to the status-log verb       -> status-log
-#   (h) dead pane: no run -> unknown/none; with a run -> run-step (not the shell)
-#   (i) kind=scout skips the run lookup                           -> pane/status-log
-#   (j) torn-down worktree / missing meta                         -> unknown/none
-#   (k) crew_is_provably_working end-to-end over the REAL helper (not a canned
+#   (f) sequential runs on one branch: stale terminated run from `axi status`
+#       is discarded when the runs list shows a newer active/current run
+#   (g) no run + semantic busy                                    -> pane
+#   (h) no run + semantic idle falls to the status-log verb       -> status-log
+#   (i) dead pane: no run -> unknown/none; with a run -> run-step (not the shell)
+#   (j) kind=scout skips the run lookup                           -> pane/status-log
+#   (k) torn-down worktree / missing meta                         -> unknown/none
+#   (l) crew_is_provably_working end-to-end over the REAL helper (not a canned
 #       fake fm-crew-state.sh verdict): cross-branch attribution via the runs
 #       list -> absorbed; genuinely no run anywhere + idle pane -> surfaced.
 #       This is the direct regression pair for the 2026-07-02 herdr incident,
@@ -783,7 +785,93 @@ EOF
   pass "another branch's run is ignored, falls back"
 }
 
-# (f) no run for this crew + a busy pane -> working via pane
+# (f) sequential runs on one branch: `axi status` can return a superseded
+# terminated run for this branch, while `no-mistakes runs` (newest-first) is
+# authoritative for which run on the branch is current. A stale terminated run
+# must never shadow an active or newer terminal successor; a genuinely current
+# failed run must still be reported as failed.
+test_sequential_run_stale_failed_shadowed_by_active() {
+  reset_fakes
+  local d short; d=$(new_case sequential-failed-shadowed)
+  make_repo_on_branch "$d/wt" fm/feat-seq
+  short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-seq.meta" "window=fm:fm-feat-seq" "worktree=$d/wt" "kind=ship"
+  # `axi status` returns the older failed run for this branch.
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-seq)"
+  # The runs list is newest-first: a newer active run exists on the same branch.
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-seq ${short}  2026-08-30 10:00
+  failed     fm/feat-seq ${short}  2026-08-30 09:00
+EOF
+)"
+  local out; out=$(run_crew_state "$d" feat-seq)
+  assert_contains "$out" "state: working" "newer active run -> working"
+  assert_contains "$out" "source: run-step" "coarse current run -> run-step source"
+  assert_contains "$out" "validating (background run)" "coarse active run detail preserved"
+  assert_not_contains "$out" "state: failed" "stale failed run must not shadow active successor"
+  pass "stale same-branch failed run is shadowed by newer active run"
+}
+
+test_sequential_run_stale_passed_shadowed_by_failed() {
+  reset_fakes
+  local d short; d=$(new_case sequential-passed-shadowed)
+  make_repo_on_branch "$d/wt" fm/feat-seq-pass
+  short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-seq-pass.meta" "window=fm:fm-feat-seq-pass" "worktree=$d/wt" "kind=ship"
+  # `axi status` returns an older passed run, but a newer run has since failed.
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-seq-pass)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-seq-pass ${short}  2026-08-30 11:00
+  completed  fm/feat-seq-pass ${short}  2026-08-30 10:00
+EOF
+)"
+  local out; out=$(run_crew_state "$d" feat-seq-pass)
+  assert_contains "$out" "state: failed" "newer failed run -> failed"
+  assert_contains "$out" "source: run-step" "coarse current run -> run-step source"
+  assert_not_contains "$out" "state: done" "stale passed run must not shadow newer failure"
+  pass "stale same-branch passed run is shadowed by newer failed run"
+}
+
+# When the runs list AGREEs with `axi status`, the full TOON detail remains
+# available, including the ci-log green check that distinguishes a monitoring
+# run from a genuinely done PR.
+test_sequential_run_agreement_keeps_full_ci_green_detail() {
+  reset_fakes
+  local d short; d=$(new_case sequential-agreement-green)
+  make_repo_on_branch "$d/wt" fm/feat-seq-green
+  short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-seq-green.meta" "window=fm:fm-feat-seq-green" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-seq-green)"
+  FM_FAKE_RUNS_LIST="  running    fm/feat-seq-green ${short}  2026-08-30 10:00"
+  FM_FAKE_CI_LOGS="all CI checks passed - still monitoring until merged or closed"
+  local out; out=$(run_crew_state "$d" feat-seq-green)
+  assert_contains "$out" "state: done" "agreed active run keeps full ci-log green detail"
+  assert_contains "$out" "source: run-step" "full detail path used when runs list agrees"
+  assert_contains "$out" "checks green" "ci-log green check is preserved"
+  pass "run-status agreement with runs list preserves full axi detail"
+}
+
+test_sequential_run_latest_failed_still_reported() {
+  reset_fakes
+  local d short; d=$(new_case sequential-latest-failed)
+  make_repo_on_branch "$d/wt" fm/feat-seq-fail
+  short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-seq-fail.meta" "window=fm:fm-feat-seq-fail" "worktree=$d/wt" "kind=ship"
+  # Both `axi status` and the runs list report the same failed run as current.
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-seq-fail)"
+  FM_FAKE_RUNS_LIST="  failed     fm/feat-seq-fail ${short}  2026-08-30 09:00"
+  local out; out=$(run_crew_state "$d" feat-seq-fail)
+  assert_contains "$out" "state: failed" "latest run failed -> failed"
+  assert_contains "$out" "source: run-step" "genuine failure -> run-step source"
+  assert_contains "$out" "run failed" "genuine failure detail preserved"
+  pass "latest same-branch failed run is still reported as failed"
+}
+
+# (g) no run for this crew + a busy pane -> working via pane
 test_no_run_busy_pane() {
   reset_fakes
   local d; d=$(new_case busy)
@@ -971,7 +1059,7 @@ test_no_run_herdr_idle_agent_status_and_idle_record_stays_idle() {
   pass "an idle record with idle agent_status stays not-busy (no regression for a human-blocked agent)"
 }
 
-# (g) no run + idle pane -> the status-log verb, as-is
+# (h) no run + idle pane -> the status-log verb, as-is
 test_no_run_idle_pane_uses_log() {
   reset_fakes
   local d; d=$(new_case idle)
@@ -1004,7 +1092,7 @@ test_no_run_idle_pane_uses_keyed_log() {
   pass "no run + idle pane parses keyed status syntax"
 }
 
-# (g') no run + idle pane on a DECLARED external-wait pause -> state: paused, so a
+# (h') no run + idle pane on a DECLARED external-wait pause -> state: paused, so a
 # supervisor reading the crew sees a distinct pause (and its reason) rather than a
 # wedge-suspect idle. This is the reader half the watcher/daemon build on.
 test_no_run_idle_pane_paused() {
@@ -1164,7 +1252,7 @@ SH
   pass "no timeout command uses perl bound"
 }
 
-# (i) kind=scout skips the run lookup entirely (its deliverable is a report).
+# (j) kind=scout skips the run lookup entirely (its deliverable is a report).
 test_scout_skips_run_lookup() {
   reset_fakes
   local d; d=$(new_case scout)
@@ -1184,7 +1272,7 @@ test_scout_skips_run_lookup() {
   pass "scout skips the run lookup"
 }
 
-# (j) torn-down worktree and missing meta are graceful (unknown/none, exit 0)
+# (k) torn-down worktree and missing meta are graceful (unknown/none, exit 0)
 test_torn_down_worktree() {
   reset_fakes
   local d; d=$(new_case torndown)
@@ -1309,7 +1397,7 @@ test_missing_meta() {
   pass "missing meta is handled gracefully"
 }
 
-# (k) crew_is_provably_working end-to-end over the REAL fm-crew-state.sh (not a
+# (l) crew_is_provably_working end-to-end over the REAL fm-crew-state.sh (not a
 # canned fake verdict, unlike tests/fm-watch-triage.test.sh's classifier
 # coverage). This is the direct regression pair for the 2026-07-02 herdr
 # incident: a validating crew whose bare `axi status` answer belongs to
@@ -1620,6 +1708,10 @@ test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status
 test_other_branch_run_ignored
+test_sequential_run_stale_failed_shadowed_by_active
+test_sequential_run_stale_passed_shadowed_by_failed
+test_sequential_run_agreement_keeps_full_ci_green_detail
+test_sequential_run_latest_failed_still_reported
 test_no_run_busy_pane
 test_no_run_expired_spawn_seed_not_working_forever
 test_no_run_fresh_spawn_seed_still_working

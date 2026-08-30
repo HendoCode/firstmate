@@ -87,6 +87,75 @@ fm_path_age() {
   echo $(( $(date +%s) - m ))
 }
 
+# Watcher sleep/wake detection. The beacon is a wall-clock mtime, so a laptop
+# sleep looks like a stale beacon even though the watcher process is still alive.
+# Only the watcher itself can distinguish suspension from a hang: while the
+# process is frozen, bash's $SECONDS counter stops advancing, so a poll whose
+# wall-clock delta far exceeds its $SECONDS delta was suspended.
+# The watcher records each wake by touching state/.watcher-sleep-wake; guards
+# read that marker and the live lock identity before raising a stale-beacon
+# alarm.
+
+fm_watcher_sleep_marker_path() {
+  printf '%s/.watcher-sleep-wake\n' "$1"
+}
+
+fm_watcher_record_sleep_wake() {
+  local state=$1 marker
+  marker=$(fm_watcher_sleep_marker_path "$state")
+  printf '%s\n' "$(date +%s)" > "$marker" 2>/dev/null || true
+}
+
+# fm_watcher_sleep_tick <state>
+# Compare wall time to the watcher's own monotonic $SECONDS each poll and record
+# a wake when the gap indicates the process was suspended. Persist the tick file
+# so the check survives across poll iterations in this single watcher process.
+fm_watcher_sleep_tick() {
+  local state=$1 tick_file wall secs last_wall last_secs delta_wall delta_secs threshold
+  tick_file="$state/.watcher-sleep-check"
+  wall=$(date +%s)
+  secs=$SECONDS
+  threshold=${FM_WATCH_SLEEP_THRESHOLD:-60}
+  if [ -f "$tick_file" ]; then
+    read -r last_wall last_secs < "$tick_file" || true
+    case "$last_wall" in ''|*[!0-9]*) last_wall= ;; esac
+    case "$last_secs" in ''|*[!0-9]*) last_secs= ;; esac
+    if [ -n "$last_wall" ] && [ -n "$last_secs" ]; then
+      delta_wall=$(( wall - last_wall ))
+      delta_secs=$(( secs - last_secs ))
+      [ "$delta_wall" -lt 0 ] && delta_wall=0
+      [ "$delta_secs" -lt 0 ] && delta_secs=0
+      if [ "$delta_wall" -gt $((delta_secs + threshold)) ]; then
+        fm_watcher_record_sleep_wake "$state"
+      fi
+    fi
+  fi
+  printf '%s %s\n' "$wall" "$secs" > "$tick_file" 2>/dev/null || true
+}
+
+# fm_watcher_beacon_stale_from_sleep <state> <watch-path> [grace] [home]
+# True when the beacon is stale because the watcher itself recorded a recent
+# sleep/wake and the recorded watcher process is still alive and identity-matched.
+# This is the pull-guard's only allowed sleep-gap suppression: a genuine crash or
+# a hung watcher that never records a wake still reports stale-beacon.
+fm_watcher_beacon_stale_from_sleep() {
+  local state=$1 watch=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME}
+  local beat marker lockdir pid beat_mtime marker_mtime
+  beat="$state/.last-watcher-beat"
+  marker=$(fm_watcher_sleep_marker_path "$state")
+  lockdir="$state/.watch.lock"
+  [ -f "$beat" ] && [ -f "$marker" ] && [ -e "$lockdir/pid" ] || return 1
+  beat_mtime=$(fm_path_mtime "$beat") || return 1
+  marker_mtime=$(fm_path_mtime "$marker") || return 1
+  [ -n "$beat_mtime" ] && [ -n "$marker_mtime" ] || return 1
+  [ "$marker_mtime" -ge "$beat_mtime" ] || return 1
+  [ "$(fm_path_age "$marker")" -lt "$grace" ] || return 1
+  pid=$(cat "$lockdir/pid" 2>/dev/null || true)
+  fm_pid_alive "$pid" || return 1
+  fm_watcher_lock_matches_pid "$state" "$watch" "$pid" "$home" || return 1
+  return 0
+}
+
 # fm_watcher_lock_unheld <state>
 # True when the watcher lock or its symlinked owner directory is absent, or when
 # the existing lock records no pid at all. Any non-empty pid remains held here;
@@ -245,6 +314,9 @@ fm_pi_extension_owns_supervision() {
 #                                             the lock (the beacon is still fresh)
 #                              stale-beacon - the beacon is stale beyond grace or
 #                                             absent (a genuine supervision lapse)
+#                              sleep-gap    - the beacon is stale but the watcher
+#                                             process is alive, identity-matched,
+#                                             and recorded a recent sleep/wake
 # autoarm: a fresh beacon within grace is healthy even with no live watcher,
 # because the watcher only runs between turns; only a stale beacon is a lapse.
 # extension: a live identity-matched watcher is the ordinary healthy state, but a
@@ -257,6 +329,10 @@ fm_pi_extension_owns_supervision() {
 # extension never restores still alarms once the beacon passes grace.
 # persistent: require a live identity-matched watcher with a fresh beacon
 # (fm_watcher_healthy); a fresh leftover beacon with no live watcher is still down.
+# A stale beacon with an alive, identity-matched watcher is treated as a sleep gap
+# only when the watcher itself recorded a recent sleep/wake (fm_watcher_beacon_stale_from_sleep),
+# so a genuine crash is still reported immediately and a hung watcher that never
+# records a wake is still caught once the marker ages out.
 # shellcheck disable=SC2034 # Read by callers after the function returns.
 FM_WATCHER_VERDICT_OK=false
 # shellcheck disable=SC2034 # Read by callers after the function returns.
@@ -290,6 +366,12 @@ fm_watcher_supervision_verdict() {
       # shellcheck disable=SC2034 # Read by callers after the function returns.
       FM_WATCHER_VERDICT_REASON=no-watcher
     fi
+  elif [ "$model" = persistent ] \
+    && fm_watcher_beacon_stale_from_sleep "$state" "$watch" "$grace" "$home"; then
+    # shellcheck disable=SC2034 # Read by callers after the function returns.
+    FM_WATCHER_VERDICT_OK=true
+    # shellcheck disable=SC2034 # Read by callers after the function returns.
+    FM_WATCHER_VERDICT_REASON=sleep-gap
   fi
   return 0
 }

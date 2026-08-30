@@ -93,6 +93,12 @@ Each record includes arm and watcher PIDs, start and end timestamps, exit code a
 The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYCLE_LOG_KEEP_LINES`.
 `state/.watch-triage.log` remains only the watcher's bounded absorbed-wake debug log and carries no lifecycle semantics.
 
+The watcher also detects its own sleep/wake suspensions.
+Each poll it compares wall-clock time to bash's `$SECONDS`; when the wall-clock gap far exceeds the `$SECONDS` gap, the process was frozen and it touches `state/.watcher-sleep-wake` to record a wake.
+The pull guard (`bin/fm-guard.sh`) treats a stale beacon as a sleep gap only when the watcher process is alive, identity-matched, and a recent sleep/wake marker is newer than the beacon.
+A genuine crash and a hung watcher that never records a wake still report stale-beacon.
+The per-process tick state lives in `state/.watcher-sleep-check`.
+
 The default 300-second grace is unchanged.
 Only the watcher process touches `state/.last-watcher-beat`; no helper process can make a wedged watcher appear healthy.
 
@@ -103,6 +109,7 @@ The same suite covers ordinary same-process session replacement for `/new`, `/re
 `tests/fm-watch-arm.test.sh` covers durable queue replay, real remote parent-replies ingestion into the authoritative status log, decision-only OPEN DECISIONS recovery, interrupted handling replay, generation-bound acknowledgement, a persistent live successor after recovery, a watcher close inside the handling window that must leave the printed acknowledgement valid, and the self-healing moved-generation acknowledgement that consumes its handled rows and names its remedy.
 `tests/fm-watch-recovery-loop.test.sh` covers the once-per-generation announcement bound with the real Pi extension against a refused handling handshake, and a handling successor that must surface a real crew event instead of going blind.
 `tests/fm-watcher-lock.test.sh` covers verified-successor attach, recovery publication before stale-lock removal, the typed self-eviction failure, bounded and successor-linked lifecycle rows, and a SIGSTOP counterfactual that distinguishes a live PID from a stale beacon before classifying termination.
+`tests/fm-watch-sleep-gap.test.sh` covers sleep/wake gap detection: a stale beacon is suppressed when the watcher is alive and has recorded a recent wake, while a killed watcher or a hung watcher without such a record still raises stale-beacon.
 `tests/fm-subagent-pretool-check.test.sh` proves Claude retains only the non-status Bash seatbelts.
 `tests/fm-claude-stop-autoarm.test.sh` covers the auto-arm's scope, stale and live session owners, unchanged AFK and need boundaries, single-flight, bounded failure retries, benign live-watcher cycle ends, one-notice failure episodes, and exit-2 translation.
 It also covers generation-claim single-flight, stuck-claim supersession, superseded-owner silence, notice-marker refusal and retry, ownership-atomic episode reset, and the legacy upgrade shim; [`turnend-guard.md`](turnend-guard.md) owns those behavior contracts.

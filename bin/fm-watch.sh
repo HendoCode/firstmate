@@ -1277,6 +1277,11 @@ while :; do
     exit 0
   fi
 
+  # Detect a sleep/wake gap before refreshing the beacon, so a just-resumed
+  # watcher can record the wake and guards can suppress a stale-beacon false
+  # alarm while the process is still alive.
+  fm_watcher_sleep_tick "$STATE"
+
   # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
   touch "$STATE/.last-watcher-beat"

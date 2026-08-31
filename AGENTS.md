@@ -209,6 +209,7 @@ When every candidate is tight, preserve the captain's strongest-reasoning class 
 Break genuine evidence ties without array-order or harness bias.
 `quota-axi` owns how model or product windows relate to bounding account windows and remains data-only.
 Load `quota-array-dispatch` before choosing among a matched profile array; that skill is the single owner of the TOON-first spendPriority selection procedure.
+When dispatching from a matched profile array, pass the ordered model ids to `fm-spawn.sh` with `--candidate-models <csv>` so the watcher can auto-rotate on a 429 rate-limit wedge without re-consulting quota.
 The generic effort fallback and its precedence are owned by `harness-adapters`: explicit captain and standing configured effort win; otherwise use low for well-understood explicit work, xhigh for ambiguous investigation or design, intermediate levels proportionally, and never max without explicit captain preference.
 Do not add model-specific versions of that policy.
 
@@ -440,6 +441,7 @@ The skill owns the daemon procedure; these safety facts remain inline:
 ### Stuck-worker trigger
 
 Load `stuck-crewmate-recovery` after a stale wake, looping or confused pane, answered-by-brief question, unresponsive worker, or failed steer.
+A detected rate-limit retry-exhaustion wedge is recovered automatically by rotating to the next model in the task's recorded candidate list; `bin/fm-rate-limit-wedge-lib.sh` owns the signature and rotation rules.
 
 ## 9. Escalation and captain etiquette
 

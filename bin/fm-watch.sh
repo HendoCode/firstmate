@@ -131,6 +131,10 @@ mkdir -p "$STATE"
 # gate and the wake emission (inbox_steer_check below).
 # shellcheck source=bin/fm-task-inbox-lib.sh
 . "$SCRIPT_DIR/fm-task-inbox-lib.sh"
+# Rate-limit wedge auto-recovery: bin/fm-rate-limit-wedge-lib.sh owns the
+# detection signature, candidate-model rotation, and recovery action.
+# shellcheck source=bin/fm-rate-limit-wedge-lib.sh
+. "$SCRIPT_DIR/fm-rate-limit-wedge-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -1557,6 +1561,16 @@ EOF
       if [ "$n" -ge 2 ] && [ "$busy_now" -ne 0 ]; then
         # The pane is idle/stale at hash $h. Triage decides whether this wakes
         # firstmate. Detection itself is unchanged from above.
+        # Before treating the idle pane as a generic possible wedge, check for a
+        # rate-limit retry-exhaustion signature in the rendered pane and rotate
+        # to the next candidate model when the task recorded one. This is routine
+        # self-healing, not an escalation; the rotation is logged as a working:
+        # status line so it remains visible.
+        if ! afk_present && [ "$kind" != secondmate ] \
+           && fm_rate_limit_wedge_try_recover "$STATE" "$task" "$tail40"; then
+          triage_log "rate-limit wedge recovery initiated: $task"
+          continue
+        fi
         if [ "$kind" = secondmate ]; then
           case "$(pause_state_class "$w" "$task")" in
             paused) handle_paused_stale "$w" "$task" "$h" ;;

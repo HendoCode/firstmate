@@ -1145,6 +1145,56 @@ crew_dispatch_validate() {
     echo "CREW_DISPATCH: invalid config/crew-dispatch.json - $err"
     return 0
   fi
+  # Validate configured models against live model catalog when available (e.g. pi --list-models)
+  local bad_models=""
+  if command -v pi >/dev/null 2>&1 || command -v pi-signed >/dev/null 2>&1; then
+    local pi_cmd pi_models
+    if command -v pi >/dev/null 2>&1; then
+      pi_cmd="pi"
+    else
+      pi_cmd="pi-signed"
+    fi
+    pi_models=$("$pi_cmd" --list-models 2>/dev/null | awk 'NR>1 {
+      p=$1; m=$2;
+      print m;
+      print p "/" m;
+      if (m ~ /^~/) {
+        sub(/^~/, "", m);
+        print m;
+        print p "/" m;
+      }
+    }' || true)
+    if [ -n "$pi_models" ]; then
+      while IFS=$'\t' read -r h m; do
+        [ -n "$h" ] && [ -n "$m" ] || continue
+        case "$h" in
+          pi|pi-signed)
+            if ! printf '%s\n' "$pi_models" | grep -Fxq "$m"; then
+              bad_models="${bad_models:+$bad_models, }$h:$m"
+            fi
+            ;;
+        esac
+      done < <(jq -r '
+        def profiles($value):
+          if ($value | type) == "array" then $value
+          elif ($value | type) == "object" then [$value]
+          else []
+          end;
+        def configured_profiles:
+          ([(.rules // [])[]? | profiles(.use?)[]?]
+            + (if has("default") then [profiles(.default)[]?] else [] end));
+        configured_profiles
+        | map(select(.model != null))
+        | map("\(.harness)\t\(.model)")
+        | unique
+        | .[]
+      ' "$file" 2>/dev/null || true)
+    fi
+  fi
+  if [ -n "$bad_models" ]; then
+    echo "CREW_DISPATCH: invalid config/crew-dispatch.json - invalid model: $bad_models"
+    return 0
+  fi
   if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ]; then
     jq -r '
     def profile($p):

@@ -1148,6 +1148,47 @@ ROWS
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }
 
+test_crew_dispatch_model_catalog_validation() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/dispatch-model-catalog"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_real_jq "$fakebin"
+
+  cat > "$fakebin/pi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --list-models ]; then
+  printf '%s\n' 'provider    model                                               context  max-out  thinking  images'
+  printf '%s\n' 'openrouter  anthropic/claude-sonnet-5                           1M       128K     yes       yes'
+  printf '%s\n' 'openrouter  google/gemini-3.7-flash                             1.0M     65.5K    yes       yes'
+  printf '%s\n' 'openrouter  ~anthropic/claude-sonnet-latest                     1M       128K     yes       yes'
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/pi"
+
+  printf '%s\n' '{"rules":[{"when":"big task","use":{"harness":"pi","model":"anthropic/claude-sonnet-5"}}],"default":[{"harness":"pi","model":"openrouter/google/gemini-3.7-flash"}]}' > "$case_dir/home/config/crew-dispatch.json"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  [ -z "$out" ] || fail "valid model catalog strings should pass silently, got: $out"
+
+  printf '%s\n' '{"rules":[{"when":"big task","use":{"harness":"pi","model":"openrouter/openrouter/pareto-code"}}]}' > "$case_dir/home/config/crew-dispatch.json"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "CREW_DISPATCH: invalid config/crew-dispatch.json - invalid model: pi:openrouter/openrouter/pareto-code" \
+    "invalid pi model was not flagged loudly"
+
+  printf '%s\n' '{"default":[{"harness":"pi","model":"nonexistent/model-x"}]}' > "$case_dir/home/config/crew-dispatch.json"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "CREW_DISPATCH: invalid config/crew-dispatch.json - invalid model: pi:nonexistent/model-x" \
+    "invalid default pi model was not flagged loudly"
+
+  pass "bootstrap validates crew-dispatch.json models against live pi model catalog"
+}
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_gh_axi_min_version
@@ -1176,3 +1217,4 @@ test_network_phases_record_per_step_elapsed_times
 test_tasks_axi_verdict_handoff_is_consumed_once
 test_crew_dispatch_active_rules_are_verbose_bootstrap_info
 test_crew_dispatch_validation
+test_crew_dispatch_model_catalog_validation

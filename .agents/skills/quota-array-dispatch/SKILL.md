@@ -100,17 +100,29 @@ Rank only from comparable known scalars.
 Never treat absent, `unknown`, or unmeasurable `spendPriority` as zero or as healthy; `0` means exact utilization, a different claim from unknown.
 An unknown `spendPriority` keeps the candidate eligible with disclosed uncertainty.
 Prefer known viable evidence when otherwise comparable.
-After the permitted TOON-to-JSON fallback, escalate to Firstmate instead of routing if no candidate can be ranked or runway uncertainty prevents proving the feasibility floor for any candidate that could be selected.
-Never resolve that terminal uncertainty by treating unknown as healthy or by choosing arbitrarily.
 Show the scalar or the literal `unknown` in the rationale; do not hide it in a score.
 
 Do not compare headroom against runway by hand.
 Do not use pace or signed reserve as a later tie-break layer.
 Do not read `aheadWindowIds`, `behindWindowIds`, `onPaceWindowIds`, `limitingWindowIds`, or other window-id lists to reconstruct what `spendPriority` already computed.
 
-Genuine ties: stop and report every tied candidate for captain choice.
+### Unmodeled provider fallback (deterministic rotation)
+
+When all passing candidates have `unknown` or unmeasurable `spendPriority` because the provider family is unmodeled by `quota-axi` (such as OpenRouter, where `quota-axi` publishes no provider windows or auth modeling):
+
+- Do not fall through silently to `config/crew-dispatch.json`'s single `default` profile or to static `config/crew-harness`.
+- Do not substitute an auto-router alias (such as `openrouter/auto` or `openrouter/openrouter/auto`), because task records must visibly name the real model that ran.
+- Do not pick arbitrarily or always select the first array element.
+- Rotate deterministically across the passing candidates using a deterministic selector: hash the task identifier or use task sequence order modulo the number of passing candidates (`hash(task_id) % N`).
+- Dispatch with that exact resolved concrete profile (`harness`, `model`, `effort`), ensuring `state/<id>.meta` records the actual model that ran.
+- Document the selection rationale visibly: disclose that quota-axi does not model the provider family, note that all candidates passed gates with unknown spendPriority, and name the concrete rotated candidate and index.
+
+### Ties and terminal uncertainty
+
+For modeled providers with comparable known scalars, genuine ties stop and report every tied candidate for captain choice.
 Do not select by array order, harness name, or another arbitrary identity ordering.
 Report duplicate concrete profiles as a configuration error.
+After the permitted TOON-to-JSON fallback, escalate to Firstmate instead of routing if no candidate can be ranked, unless the unmodeled-provider rotation procedure above applies, or if runway uncertainty prevents proving the feasibility floor for any candidate that could be selected.
 
 Account for every candidate visibly before selecting or escalating, naming its catalog evidence, provider relation, applicable quota and authentication facts, remaining uncertainty, fit and reasoning class, `spendPriority`, and runway-versus-horizon result.
 A blocked credential report must name `harness`, `model`, authentication surface, and concrete failure evidence; never emit a bare `Grok unauthenticated` statement.

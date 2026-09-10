@@ -11,20 +11,15 @@ bin/fm-usage-extract.sh --summary  # Quick total
 
 ## Your setup
 
-Amazon Bedrock + xAI via OpenCode. Usage extracted from `~/.local/share/opencode/opencode.db`.
+Sources are local harness stores, aggregated by `bin/fm-usage-by-model.sh`:
+- OpenCode SQLite (`~/.local/share/opencode/opencode.db`)
+- Claude Code JSONL (`~/.claude/projects/**/*.jsonl`)
+- Pi session JSONL (`~/.pi/agent/sessions/**/*.jsonl`)
 
-**Total usage:**
-- 495 turns
-- 12.1M input tokens, 92K output
-- **~$8.65 estimated**
-
-Top models by spend:
-- amazon-bedrock/zai.glm-5: $3.97 (150 turns)
-- xai/grok-4.3: $2.10 (192 turns)
-- amazon-bedrock/nvidia.nemotron-super-3-120b: $1.47 (67 turns)
+On this box only Pi sessions exist today; the laptop-era OpenCode and Claude Code stores are gone, so those sources contribute zero. Run the commands above for live numbers instead of trusting any snapshot here.
 
 ## Pricing
 
-Rates in `data/usage-rates.json`. Update when you know actual Bedrock/xAI pricing.
+Rates in `data/usage-rates.json`. Update when you know actual provider pricing for models not covered by Pi's own computed cost.
 
 Base directory: .agents/skills/usage

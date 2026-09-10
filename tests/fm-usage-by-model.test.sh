@@ -13,11 +13,14 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 
 # synthetic opencode.db
 OC_DB="$TEST_DIR/opencode.db"
-sqlite3 "$OC_DB" <<'SQL'
-CREATE TABLE message (time_created INTEGER, data TEXT);
-INSERT INTO message VALUES (1724800000000, '{"providerID":"anthropic","modelID":"claude-3-5-sonnet","tokens":{"input":100,"output":50,"cache.read":10,"cache.write":5}}');
-INSERT INTO message VALUES (1724800000000, '{"providerID":"anthropic","modelID":"claude-3-5-sonnet","tokens":{"input":200,"output":75}}');
-SQL
+python3 - "$OC_DB" <<'PYEOF'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE message (time_created INTEGER, data TEXT)")
+con.execute("INSERT INTO message VALUES (1724800000000, ?)", ('{"providerID":"anthropic","modelID":"claude-3-5-sonnet","tokens":{"input":100,"output":50,"cache.read":10,"cache.write":5}}',))
+con.execute("INSERT INTO message VALUES (1724800000000, ?)", ('{"providerID":"anthropic","modelID":"claude-3-5-sonnet","tokens":{"input":200,"output":75}}',))
+con.commit()
+PYEOF
 
 # synthetic claude-code jsonl (one day)
 CC_DIR="$TEST_DIR/.claude/projects/p1"

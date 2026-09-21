@@ -60,16 +60,23 @@ unit_propose_confirm_records_the_posture_without_a_daemon() {
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-propose.XXXXXX")
   mkdir -p "$st/state"
   out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" propose \
-    --words 'merge the windows fix when green' --action merge --object 'task fix-windows PR' --when 'checks green' \
-    --action merge --object regardless 2>&1)
+    --words 'merge the windows fix when green' --expected-return 2026-09-08T08:00Z --spend 2 2>&1)
   rc=$?
-  if [ "$rc" -eq 3 ] && [ -f "$st/state/.afk-contract.proposed" ] \
-    && printf '%s' "$out" | grep -F '1. merge task fix-windows PR when checks green' >/dev/null \
-    && printf '%s' "$out" | grep -F '2. "action=merge object=regardless when=(none)" - refused: missing when' >/dev/null \
+  if [ "$rc" -eq 0 ] && [ -f "$st/state/.afk-contract.proposed" ] \
+    && printf '%s' "$out" | grep -F '    merge the windows fix when green' >/dev/null \
+    && printf '%s' "$out" | grep -F 'expected return: 2026-09-08T08:00Z' >/dev/null \
+    && printf '%s' "$out" | grep -F 'spend cap: 2 concurrent workers' >/dev/null \
     && [ ! -e "$st/state/.afk-contract" ]; then
-    pass "propose: the read-back lists accepted and refused clauses and writes only a proposal"
+    pass "propose: the read-back carries the words verbatim with the expected return and spend cap, and writes only a proposal"
   else
     fail "propose: read-back or proposal wrong (rc=$rc): $out"
+  fi
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" propose --words 'merge it' --grant fix-windows 2>&1)
+  rc=$?
+  if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -F -- '--grant was retired' >/dev/null; then
+    pass "propose: the retired --grant flag is refused by name"
+  else
+    fail "propose: --grant was not refused by name (rc=$rc): $out"
   fi
   out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" confirm 2>&1)
   rc=$?
@@ -81,7 +88,7 @@ unit_propose_confirm_records_the_posture_without_a_daemon() {
     fail "confirm: record, announcement, or daemon state wrong (rc=$rc): $out"
   fi
   printf 'schema\tfm-afk-return.v1\nphase\tblocked\n' > "$st/state/.afk-return-catchup"
-  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" propose --action merge --object 'task a PR' --when 'checks green' >/dev/null 2>&1; then
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" propose --words 'merge task a PR when green' >/dev/null 2>&1; then
     fail "propose: accepted a new mandate while the prior return catch-up was pending"
   else
     pass "propose: refuses while the prior return catch-up is pending"
@@ -120,7 +127,7 @@ unit_daemon_entry_requires_confirmation() {
   local st out rc
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-entry-record.XXXXXX")
   mkdir -p "$st/state"
-  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$CONTRACT" propose --action merge --object 'task a PR' --when 'checks green' >/dev/null 2>&1
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$CONTRACT" propose --words 'merge task a PR when green' >/dev/null 2>&1
   out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-native 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ] && [ -f "$st/state/.afk-contract.proposed" ] && [ ! -e "$st/state/.afk-contract" ] \
@@ -277,6 +284,112 @@ unit_fresh_vs_refresh() {
   fi
   kill "$sleep_pid" 2>/dev/null || true
   wait "$sleep_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
+# ---------------------------------------------------------------------------
+# UNIT 2a: away/quiet mode plumbing (kunchenguid/firstmate#2356). fm_afk_mode
+# is the single owner of reading the mode; these pin its write side
+# (fm_afk_launch_flag_write / fm_afk_flag_write) against the exact double-
+# write risk a live entry hits - the launcher writes the flag, then the
+# terminal-side fm-afk-start.sh entry re-writes it a second time on every
+# real (non-native) entry, per UNIT 2 above.
+# ---------------------------------------------------------------------------
+read_mode() {  # <state-dir>
+  bash -c '. "$1"; fm_afk_mode "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$1"
+}
+
+unit_mode_explicit_write() {
+  local st out
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-mode-explicit.XXXXXX")
+  mkdir -p "$st/state"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_MODE=quiet \
+    bash -c '. "$1"; fm_afk_launch_flag_write' _ "$LAUNCH"
+  out=$(read_mode "$st/state")
+  if [ "$out" = quiet ]; then
+    pass "mode: a fresh entry with FM_AFK_MODE=quiet writes quiet"
+  else
+    fail "mode: explicit FM_AFK_MODE=quiet fresh entry wrote '$out' instead of quiet"
+  fi
+  rm -rf "$st"
+}
+
+unit_mode_fresh_defaults_away() {
+  local st out
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-mode-default.XXXXXX")
+  mkdir -p "$st/state"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
+    bash -c '. "$1"; fm_afk_launch_flag_write' _ "$LAUNCH"
+  out=$(read_mode "$st/state")
+  if [ "$out" = away ]; then
+    pass "mode: a fresh entry with FM_AFK_MODE unset defaults to away"
+  else
+    fail "mode: fresh unset-mode entry wrote '$out' instead of away"
+  fi
+  rm -rf "$st"
+}
+
+unit_mode_refresh_preserves_quiet() {
+  local st sleep_pid lock out
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-mode-preserve.XXXXXX")
+  mkdir -p "$st/state"
+  printf 'quiet\n%s\n' "$(date '+%s')" > "$st/state/.afk"
+  sleep 600 &
+  sleep_pid=$!
+  lock="$st/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$sleep_pid" > "$lock/pid"
+  ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$sleep_pid" > "$lock/pid-identity" 2>/dev/null ) || true
+  # The exact real-entry shape: a bare direct re-write with no explicit mode,
+  # simulating the terminal-side fm-afk-start.sh redundant write that would
+  # silently clobber quiet back to away if it were not preserve-on-refresh.
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$START" >/dev/null 2>&1
+  out=$(read_mode "$st/state")
+  if [ "$out" = quiet ]; then
+    pass "mode: a bare refresh (FM_AFK_MODE unset) of an already-running quiet daemon preserves quiet, never resets to away"
+  else
+    fail "mode: refresh incorrectly changed quiet mode to '$out'"
+  fi
+  kill "$sleep_pid" 2>/dev/null || true
+  wait "$sleep_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
+unit_mode_garbage_and_legacy_content_reads_away() {
+  local st out
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-mode-garbage.XXXXXX")
+  mkdir -p "$st/state"
+
+  : > "$st/state/.afk"
+  out=$(read_mode "$st/state")
+  if [ "$out" = away ]; then
+    pass "mode: an empty (legacy pre-mode) flag reads as away"
+  else
+    fail "mode: empty flag read as '$out' instead of away"
+  fi
+
+  date '+%s' > "$st/state/.afk"
+  out=$(read_mode "$st/state")
+  if [ "$out" = away ]; then
+    pass "mode: a bare-epoch-timestamp (legacy pre-mode) flag reads as away"
+  else
+    fail "mode: legacy timestamp flag read as '$out' instead of away"
+  fi
+
+  printf 'nonsense-mode\n' > "$st/state/.afk"
+  out=$(read_mode "$st/state")
+  if [ "$out" = away ]; then
+    pass "mode: unrecognized content falls back to away"
+  else
+    fail "mode: unrecognized content read as '$out' instead of away"
+  fi
+
+  out=$(read_mode "$st/state/missing")
+  if [ "$out" = away ]; then
+    pass "mode: a missing flag reads as away"
+  else
+    fail "mode: missing flag read as '$out' instead of away"
+  fi
   rm -rf "$st"
 }
 
@@ -1087,6 +1200,10 @@ unit_failed_daemon_launch_preserves_confirmed_record
 unit_stop_archives_the_record_last
 unit_relative_paths_are_absolute_before_daemon_launch
 unit_fresh_vs_refresh
+unit_mode_explicit_write
+unit_mode_fresh_defaults_away
+unit_mode_refresh_preserves_quiet
+unit_mode_garbage_and_legacy_content_reads_away
 unit_stop_ordering
 unit_stop_rejects_reused_pid
 unit_failed_start_rolls_back_state

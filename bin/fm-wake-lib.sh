@@ -396,6 +396,28 @@ fm_afk_daemon_owns_supervision() {
   [ "$current" = "$recorded" ]
 }
 
+# fm_afk_mode <state>
+# The single owner of reading state/.afk's declared mode. Always prints
+# exactly one of "away" or "quiet" and always succeeds - every caller gets a
+# definitive answer, never an error to handle. Presence/liveness stays owned
+# by fm_afk_daemon_owns_supervision and the raw `-e "$state/.afk"` checks
+# throughout the tree; this is the mode of an ALREADY-present flag.
+# "away" (today's return-on-any-unmarked-message behavior) is the safe
+# default: missing, empty, unreadable, or unrecognized content, and the
+# legacy bare-epoch-timestamp content written before mode existed, all read
+# as "away". Only an exact first-line "quiet" ever reads as "quiet" -
+# kunchenguid/firstmate#2356's standing captain-present quiet mode, entered
+# only through /quiet and exited only through an explicit /quiet off
+# (AGENTS.md section 8's away-mode stub).
+fm_afk_mode() {
+  local state=$1 mode
+  mode=$(head -n 1 "$state/.afk" 2>/dev/null) || { printf '%s\n' away; return 0; }
+  case "$mode" in
+    quiet) printf '%s\n' quiet ;;
+    *) printf '%s\n' away ;;
+  esac
+}
+
 # fm_watcher_supervision_verdict <state> <watch-path> [grace] [home] [root]
 # Model-aware "is supervision healthy right now" verdict for the pull warning
 # guard (bin/fm-guard.sh), NOT the arm layer or the turn-end guard. Sets:
@@ -1292,6 +1314,121 @@ fm_treehouse_project_lock_path() {  # <project-dir>
   printf '%s/.treehouse-project-%s.lock\n' "$root/state" "$hash"
 }
 
+# A Treehouse slot has the managed pool's fixed <pool>/<slot>/<repo> layout.
+# Require both its pool state and the same Git common directory as the recorded
+# project; an ordinary linked worktree is not evidence that Treehouse owns it.
+fm_treehouse_pool_slot() {  # <project-dir> <worktree>
+  local project=$1 worktree=$2 slot pool state project_common slot_common
+  [ -d "$project" ] && [ -d "$worktree" ] || return 1
+  slot=$(CDPATH='' cd -- "$worktree" 2>/dev/null && pwd -P) || return 1
+  pool=$(dirname "$(dirname "$slot")")
+  state="$pool/treehouse-state.json"
+  [ -f "$state" ] && [ ! -L "$state" ] || return 1
+  project_common=$(git -C "$project" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  slot_common=$(git -C "$slot" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  project_common=$(CDPATH='' cd -- "$project_common" 2>/dev/null && pwd -P) || return 1
+  slot_common=$(CDPATH='' cd -- "$slot_common" 2>/dev/null && pwd -P) || return 1
+  [ "$project_common" = "$slot_common" ]
+}
+
+# Slot-owner claim: which task a Treehouse pool slot currently belongs to.
+#
+# Treehouse can record ownership durably: `treehouse get --lease --lease-holder`
+# reserves a slot under a label until `treehouse return --if-lease-holder`
+# releases it, and Firstmate uses exactly that for secondmate homes
+# (bin/fm-home-seed.sh). Crewmate spawns do not take that path: they acquire
+# their slot through the interactive pane-driven `treehouse get`, whose state
+# entry is a live process lease (owner_pid plus owner_started_at, and `treehouse
+# status` reports in-use from the processes actually running under the path).
+# That answers "is anything running here", never "which task owns this", and it
+# is released by the very event that makes a task record stale - the worker
+# exiting - so a slot whose lease has lapsed reads identical whether it is still
+# this task's or has since been handed to another one. Firstmate therefore keeps
+# its own claim on top: one file naming the task that took the slot, written by
+# bin/fm-spawn.sh under the same project lock that allocates the slot and
+# released by bin/fm-teardown.sh when the slot goes back to the pool. Moving
+# crewmate spawns onto the durable lease is separate follow-up work.
+#
+# The claim lives at <pool>/<slot>/.fm-slot-owner - a sibling of the repo
+# checkout rather than a file inside it - so claiming a slot can never dirty the
+# copy teardown's landed-work checks inspect, and a returned slot carries no
+# untracked leftover from it.
+fm_treehouse_slot_owner_marker() {  # <worktree>
+  local worktree=$1 slot
+  slot=$(CDPATH='' cd -- "$worktree" 2>/dev/null && pwd -P) || return 1
+  printf '%s/.fm-slot-owner\n' "$(dirname "$slot")"
+}
+
+# Claim a pool slot for a task, replacing whatever the previous holder left.
+# The rename is atomic, so a reader either sees the old claim or the new one.
+fm_treehouse_slot_owner_claim() {  # <worktree> <task-id> <home>
+  local worktree=$1 id=$2 home=$3 marker tmp
+  [ -n "$id" ] || return 1
+  marker=$(fm_treehouse_slot_owner_marker "$worktree") || return 1
+  # Only a plain claim file may be replaced: renaming onto a directory would
+  # move the new claim inside it and leave the slot reading as unclaimable.
+  if { [ -e "$marker" ] || [ -L "$marker" ]; } \
+     && { [ ! -f "$marker" ] || [ -L "$marker" ]; }; then
+    return 1
+  fi
+  tmp="$marker.tmp.${BASHPID:-$$}"
+  rm -f "$tmp" || return 1
+  {
+    printf 'task=%s\n' "$id"
+    printf 'home=%s\n' "$home"
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$marker" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# Read the claim on a pool slot and compare it with a task id.
+# Sets FM_TREEHOUSE_SLOT_OWNER to one of:
+#   mine   - the claim names this task
+#   other  - the claim names a different task, so the slot was reassigned
+#   absent - no claim: the slot was taken before claims existed, or returned since
+#   unsafe - a claim file exists but cannot be read as a claim
+# FM_TREEHOUSE_SLOT_OWNER_ID and FM_TREEHOUSE_SLOT_OWNER_HOME carry the recorded
+# claimant as evidence. The home is reported, never matched: a home that moved
+# must not turn a task's own slot into a refusal.
+fm_treehouse_slot_owner_state() {  # <worktree> <task-id>
+  local worktree=$1 id=$2 marker line owner_id='' owner_home=''
+  FM_TREEHOUSE_SLOT_OWNER=unsafe
+  FM_TREEHOUSE_SLOT_OWNER_ID=
+  FM_TREEHOUSE_SLOT_OWNER_HOME=
+  marker=$(fm_treehouse_slot_owner_marker "$worktree") || return 0
+  if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+    FM_TREEHOUSE_SLOT_OWNER=absent
+    return 0
+  fi
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      task=*) owner_id=${line#task=} ;;
+      home=*) owner_home=${line#home=} ;;
+    esac
+  done < "$marker" || return 0
+  [ -n "$owner_id" ] || return 0
+  # shellcheck disable=SC2034 # Output globals, read by the sourcing caller.
+  FM_TREEHOUSE_SLOT_OWNER_ID=$owner_id
+  # shellcheck disable=SC2034 # Output globals, read by the sourcing caller.
+  FM_TREEHOUSE_SLOT_OWNER_HOME=$owner_home
+  if [ "$owner_id" = "$id" ]; then
+    FM_TREEHOUSE_SLOT_OWNER=mine
+  else
+    FM_TREEHOUSE_SLOT_OWNER=other
+  fi
+}
+
+# Drop a task's own claim once its slot is back in the pool. Never removes
+# another task's claim, so a misdirected release cannot strip the evidence that
+# protects the slot's real owner.
+fm_treehouse_slot_owner_release() {  # <worktree> <task-id>
+  local worktree=$1 id=$2 marker
+  fm_treehouse_slot_owner_state "$worktree" "$id"
+  [ "$FM_TREEHOUSE_SLOT_OWNER" = mine ] || return 0
+  marker=$(fm_treehouse_slot_owner_marker "$worktree") || return 0
+  rm -f "$marker" 2>/dev/null || true
+}
+
 fm_failure_episode_reset() {
   local state=$1 mode=${2:-acquire} lock current pid acquired=0 path
   lock="$state/.turnend-claude-blocks.lock"
@@ -2102,43 +2239,79 @@ fm_wake_status_mark_current() {  # <state> <status-file>
   fm_wake_status_seen_commit "$1" "$2" "$size" "$ident"
 }
 
-# Guarded self-announced status append - the one dedup primitive for a status
-# line THIS home's own machinery writes as bookkeeping it has already presented
-# in the very turn or tick that writes it (an answerer-closes resolved line, a
-# pending-reply escalation close, a captain-held transfer). Such a close must
-# not wake the session that wrote it, so this appends the line and then
-# advances the watcher's seen marker to cover exactly the appended bytes and
-# nothing else. The advance is provenance-gated and fails toward waking:
-#   - the marker advances ONLY when the file's pre-append signature matched the
-#     recorded seen marker (every earlier byte was already announced or
-#     deliberately absorbed), AND the post-append size equals the pre-append
-#     size plus exactly the appended bytes (no foreign write interleaved);
-#   - on ANY other condition - missing marker, pending foreign bytes, an
-#     interleaved writer, an unreadable signature - the line is still appended
-#     but the marker is left alone, so the watcher surfaces the file normally.
+# Guarded self-announced status append - the one dedup primitive for the status
+# lines THIS home's own machinery writes as bookkeeping it has already presented
+# in the very turn or tick that writes them (answerer-closes resolved lines, a
+# pending-reply escalation close, captain-held transfers). Such a close must
+# not wake the session that wrote it, so this appends one command's lines
+# together and then advances the watcher's seen marker across the appended
+# bytes and no byte this home has not already read. The advance is
+# provenance-gated and fails toward waking:
+#   - the marker advances only when this home already read every pre-append
+#     byte, the post-append size equals that size plus exactly the appended
+#     bytes (no foreign write interleaved), AND the watcher's own span
+#     classifier finds no actionable event from its classified offset through
+#     the post-append end (classifying after the append keeps the just-closed
+#     decisions from counting as live);
+#   - "already read" means the watcher's classified seen offset equals the
+#     pre-append size, or the OPEN DECISIONS fold cursor does and every
+#     non-blank line the watcher has not classified yet is a keyed
+#     needs-decision or blocked line, which OPEN DECISIONS listed as open. The
+#     fold reads bytes it never prints, so a worker's `failed:`, `paused:`,
+#     `working:`, `resolved` or verb-less line there must still wake, and so
+#     must a captain-held line, which raises the watcher's needs-decision
+#     side-band;
+#   - on ANY other condition - a missing file, pending foreign bytes, an
+#     interleaved writer, an unreadable size or identity - the lines are still
+#     appended but the marker is left alone, so the watcher surfaces the file
+#     normally.
 # A later, different line from any other writer grows the size past the marker
 # and wakes as before: task identity alone can never suppress new content.
+# Each line is stamped with its emission time on the way in (status_stamp_line,
+# bin/fm-classify-lib.sh), so the appended bytes are the stamped ones, not the
+# caller's: a caller that caps a line first must reserve status_stamp_width,
+# and one that suppresses a repeat must ask status_event_recorded rather than
+# compare exact bytes.
 # Returns 0 appended and self-announced, 1 appended but left for the watcher
 # (the safe direction), 2 the append itself failed.
-fm_wake_status_append_self_announced() {  # <state> <status-file> <line>
-  local state=$1 file=$2 line=$3 marker pre_sig='' pre_size='' pre_ident='' post_size post_ident
-  local LC_ALL=C
+fm_wake_status_append_self_announced() {  # <state> <status-file> <line>...
+  local state=$1 file=$2 line appended=0 pre_size='' pre_ident='' post_size post_ident classified folded lag span_rc=0
+  local LC_ALL=C stamped=()
+  shift 2
   _fm_wake_require_classify || return 1
-  marker=$(fm_wake_signal_seen_path "$state" "$file")
+  for line in "$@"; do
+    stamped+=("$(status_stamp_line "$line")")
+  done
   if [ -e "$file" ]; then
-    pre_sig=$(fm_wake_signal_sig "$file") || pre_sig=''
     pre_size=$(_fm_status_file_size "$file") || pre_size=''
     pre_ident=$(_fm_open_decisions_file_ident "$file") || pre_ident=''
   fi
-  printf '%s\n' "$line" >> "$file" || return 2
-  [ -n "$pre_sig" ] || return 1
-  status_presentation_marker_reported_matches "$marker" "$pre_sig" || return 1
-  [ "$(status_presentation_marker_offset "$marker" "$file")" = "$pre_size" ] || return 1
+  printf '%s\n' "${stamped[@]}" >> "$file" || return 2
   post_size=$(_fm_status_file_size "$file") || return 1
   post_ident=$(_fm_open_decisions_file_ident "$file") || return 1
   case "$pre_size$post_size" in ''|*[!0-9]*) return 1 ;; esac
   [ -n "$pre_ident" ] && [ "$post_ident" = "$pre_ident" ] || return 1
-  [ "$post_size" -eq $((pre_size + ${#line} + 1)) ] || return 1
+  for line in "${stamped[@]}"; do appended=$((appended + ${#line} + 1)); done
+  [ "$post_size" -eq $((pre_size + appended)) ] || return 1
+  classified=$(fm_wake_signal_seen_size "$state" "$file")
+  if [ "$classified" != "$pre_size" ]; then
+    folded=$(status_open_decisions_cursor_offset "$file") || folded=0
+    [ "$folded" = "$pre_size" ] && [ "$classified" -lt "$pre_size" ] || return 1
+    lag=$(_fm_status_read_span "$file" "$classified" "$((pre_size - classified))") || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in *[![:space:]]*) ;; *) continue ;; esac
+      case "$(status_line_verb "$line")" in
+        needs-decision|blocked) ;;
+        *) return 1 ;;
+      esac
+      _fm_key_before_colon "$line" || _fm_key_at_note_head "$line" >/dev/null || return 1
+      _fm_decision_key "$line" >/dev/null || return 1
+    done <<EOF
+$lag
+EOF
+  fi
+  status_span_first_actionable_record "$file" "$classified" >/dev/null || span_rc=$?
+  [ "$span_rc" -eq 1 ] || return 1
   fm_wake_status_seen_commit "$state" "$file" "$post_size" "$post_ident" || return 1
   return 0
 }

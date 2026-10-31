@@ -129,11 +129,8 @@ FM_BACKEND_HERDR_MIN_PRESENTATION_VERSION=0.8.0
 # below-floor warning would repeat on every crewmate; the key is the detected
 # release, so an upgrade or a downgrade is announced again.
 FM_BACKEND_HERDR_PRESENTATION_FLOOR_MARKER_PREFIX=".herdr-presentation-floor-"
-# Per-pane escalation dedupe marker prefix, under the state dir. One marker per
-# window (keyed like the watcher's own .stale-<key>): set when a ->blocked edge
-# is enqueued, cleared on any working edge, so exactly one wake fires per
-# ->blocked edge and a reconnect level-reconcile never re-delivers a still-
-# blocked pane. Mirrors bin/fm-watch.sh's .stale-<key> naming.
+# Per-pane escalation dedupe marker prefix, under the state dir
+# (bin/fm-transition-lib.sh owns the dedupe contract).
 FM_BACKEND_HERDR_ESCALATED_PREFIX=".herdr-escalated-"
 # .fm-secondmate-home is written by bin/fm-home-seed.sh (AGENTS.md section 6)
 # at a seeded secondmate home's root, containing exactly that secondmate's id.
@@ -509,7 +506,7 @@ fm_backend_herdr_client_select() {  # <session> [force]
 
 # fm_backend_herdr_tool_check: refuse loudly if herdr or jq is missing.
 fm_backend_herdr_tool_check() {
-  command -v herdr >/dev/null 2>&1 || { echo "error: backend=herdr selected but the 'herdr' CLI is not installed (https://herdr.dev) (dual-licensed AGPL-3.0-or-later/commercial)" >&2; return 1; }
+  command -v herdr >/dev/null 2>&1 || { echo "error: backend=herdr selected but the 'herdr' CLI is not installed (https://herdr.dev) (Apache-2.0)" >&2; return 1; }
   command -v jq >/dev/null 2>&1 || { echo "error: backend=herdr selected but 'jq' is not installed (required to parse herdr's JSON output)" >&2; return 1; }
   return 0
 }
@@ -1676,6 +1673,31 @@ fm_backend_herdr_projection_order_best_effort() {  # <session> <created-workspac
   return 0
 }
 
+# External server ownership (issue #7320). A service manager such as a systemd
+# user unit can own a session's server, and then only it may start one: a
+# Firstmate-started server races the owner during a unit restart or a
+# `server live-handoff`, while `status` briefly reports not running, and splits
+# panes across two servers. The owner declares itself with marker files in the
+# session directory, the directory holding the `.server.socket` that
+# `status --json` reports whether or not the server is running
+# (docs/verification/runtime-backends.md "Session directory"), shared by every
+# Firstmate home on that session:
+#   firstmate-server-owner      persistent; first line names the owner
+#   firstmate-server-replacing  present only while the owner replaces the server
+# docs/herdr-backend.md "Externally managed servers" owns the operator contract.
+FM_BACKEND_HERDR_SERVER_OWNER_MARKER=firstmate-server-owner
+FM_BACKEND_HERDR_SERVER_REPLACING_MARKER=firstmate-server-replacing
+
+# fm_backend_herdr_server_owner_name: the owner named by <owner-marker>'s first
+# line, or a generic name when it names none.
+fm_backend_herdr_server_owner_name() {  # <owner-marker>
+  local name
+  name=$(head -n 1 "$1" 2>/dev/null | tr -d '[:cntrl:]' | cut -c1-200)
+  name=${name#"${name%%[![:space:]]*}"}
+  name=${name%"${name##*[![:space:]]}"}
+  printf '%s' "${name:-an external service manager}"
+}
+
 # fm_backend_herdr_server_ensure: start the herdr server for <session>
 # headless (no TUI client) if not already running, mirroring tmux's `tmux
 # has-session || tmux new-session -d`. Verified: a bare socket CLI call does
@@ -1684,10 +1706,43 @@ fm_backend_herdr_projection_order_best_effort() {  # <session> <created-workspac
 # every later pane, so remove home, harness identity, and supervision selection
 # inherited from whichever agent happened to start it. Bounded poll for the
 # server to report running.
+#
+# A running server returns after one marker check in the session directory,
+# unless that directory holds a replacement marker. While the session directory
+# holds an owner marker with the server down, or a replacement marker at all,
+# this never starts or releases callers to the server: it polls the
+# non-starting fm_backend_herdr_server_running_state read up to 60 times, 0.5s
+# apart, until the replacement marker is gone and the server reports running,
+# and fails naming the replacement or the owner otherwise. A replacement marker that
+# clears with no owner marker hands back to the Firstmate-owned start below.
 fm_backend_herdr_server_ensure() {  # <session>
-  local session=$1 running out i
-  running=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | jq -r '.server.running // false' 2>/dev/null)
-  [ "$running" = "true" ] && return 0
+  local session=$1 status running socket out i dir owner_marker replacing_marker owner polls=60
+  status=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null)
+  running=$(printf '%s' "$status" | jq -r '.server.running // false' 2>/dev/null)
+  socket=$(printf '%s' "$status" | jq -r '.server.socket // empty' 2>/dev/null)
+  if [ -z "$socket" ]; then
+    [ "$running" = "true" ] && return 0
+  else
+    dir=$(dirname "$socket")
+    owner_marker="$dir/$FM_BACKEND_HERDR_SERVER_OWNER_MARKER"
+    replacing_marker="$dir/$FM_BACKEND_HERDR_SERVER_REPLACING_MARKER"
+    [ "$running" = "true" ] && [ ! -e "$replacing_marker" ] && return 0
+    i=0
+    while [ -e "$owner_marker" ] || [ -e "$replacing_marker" ]; do
+      if [ "$i" -ge "$polls" ]; then
+        if [ -e "$replacing_marker" ]; then
+          echo "error: herdr server for session '$session' is being replaced ($replacing_marker) and the replacement did not finish after $polls checks; Firstmate will not start or use a server while that marker exists" >&2
+        else
+          owner=$(fm_backend_herdr_server_owner_name "$owner_marker")
+          echo "error: herdr server for session '$session' is managed by $owner ($owner_marker) and did not report running after $polls checks; Firstmate will not start it - start or repair it through $owner" >&2
+        fi
+        return 1
+      fi
+      sleep 0.5
+      i=$((i + 1))
+      [ ! -e "$replacing_marker" ] && [ "$(fm_backend_herdr_server_running_state "$session")" = running ] && return 0
+    done
+  fi
   (
     unset FM_HOME FM_ROOT_OVERRIDE FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE \
       CURSOR_AGENT CURSOR_INVOKED_AS CLAUDECODE PI_CODING_AGENT FM_PI_HARNESS GROK_AGENT FM_SUPERVISION_MODEL
@@ -3234,10 +3289,13 @@ fm_backend_herdr_composer_identity() {  # <target> -> "<agent>\t<status>"
 fm_backend_herdr_composer_state() {  # <target> -> empty|pending|pending-unproven|unknown
   local target=$1 cap caps verdict identity
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  # cortex=ask: a titled rounded composer box is the one shape a Cortex agent
+  # identity changes, so the classifier answers need-identity for it and the
+  # lazy probe below runs; no other verdict pays for it.
   if cap=$(fm_backend_herdr_visible_capture_ansi "$target" 2>/dev/null); then
-    caps=$(printf 'styled=1\ncursor=0\nidentity=1')
+    caps=$(printf 'styled=1\ncursor=0\nidentity=1\ncortex=ask')
   elif cap=$(fm_backend_herdr_visible_capture "$target"); then
-    caps=$(printf 'styled=0\ncursor=0\nidentity=1')
+    caps=$(printf 'styled=0\ncursor=0\nidentity=1\ncortex=ask')
   else
     printf 'unknown'
     return 0
@@ -3941,60 +3999,22 @@ fm_backend_herdr_event_reader_cmd() {
   printf '%s\n' "$FM_BACKEND_HERDR_ROOT/bin/backends/herdr-eventwait.py"
 }
 
-# fm_backend_herdr_escalation_marker: the per-pane dedupe marker path for a
-# <window> ("<session>:<pane_id>"), keyed identically to the watcher's
-# .stale-<key> (tr ':/.' '___'), under <state_dir>.
+# The per-pane escalation dedupe (marker path, apply, commit, clear) is the
+# shared owner's (bin/fm-transition-lib.sh); these keep herdr's marker prefix.
 fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
-  local state=$1 window=$2 key
-  key=$(printf '%s' "$window" | tr ':/.' '___')
-  printf '%s/%s%s' "$state" "$FM_BACKEND_HERDR_ESCALATED_PREFIX" "$key"
+  fm_transition_marker "$1" "$FM_BACKEND_HERDR_ESCALATED_PREFIX" "$2"
 }
 
-# fm_backend_herdr_apply_transition: route one normalized record through the
-# shared policy table, maintaining the per-pane dedupe marker under <state_dir>.
-# On a fresh `actionable` (blocked) edge - policy actionable AND no marker yet -
-# it prints the record on stdout and returns 0 (the caller stops and hands the
-# record up). The caller commits the marker only after handling the record.
-# `absorb` (working) clears the marker and
-# returns 1. `defer`/`fallback`, and an already-marked `actionable`, return 1
-# with no output. <session> reconstructs the window ("<session>:<pane_id>") for
-# the marker key, matching the watcher's own key scheme.
 fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
-  local state=$1 session=$2 record=$3 pane_id to action window marker
-  pane_id=$(fm_transition_pane_id "$record")
-  [ -n "$pane_id" ] || return 1
-  to=$(fm_transition_to_status "$record")
-  action=$(fm_transition_policy "$to")
-  window="$session:$pane_id"
-  marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
-  case "$action" in
-    actionable)
-      if [ ! -e "$marker" ]; then
-        printf '%s' "$record"
-        return 0
-      fi
-      ;;
-    absorb)
-      rm -f "$marker" 2>/dev/null || true
-      ;;
-  esac
-  return 1
+  fm_transition_apply "$1" "$FM_BACKEND_HERDR_ESCALATED_PREFIX" "$2" "$3"
 }
 
 fm_backend_herdr_commit_transition() {  # <state_dir> <session> <record>
-  local state=$1 session=$2 record=$3 pane_id window marker
-  pane_id=$(fm_transition_pane_id "$record")
-  [ -n "$pane_id" ] || return 1
-  window="$session:$pane_id"
-  marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
-  : > "$marker"
+  fm_transition_commit "$1" "$FM_BACKEND_HERDR_ESCALATED_PREFIX" "$2" "$3"
 }
 
 fm_backend_herdr_clear_transition() {  # <state_dir> <window>
-  local state=$1 window=$2 marker
-  [ -n "$window" ] || return 0
-  marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
-  rm -f "$marker" 2>/dev/null || true
+  fm_transition_clear "$1" "$FM_BACKEND_HERDR_ESCALATED_PREFIX" "$2"
 }
 
 # fm_backend_herdr_wait_transition: the bounded event wait. Blocks up to

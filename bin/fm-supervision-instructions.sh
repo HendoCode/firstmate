@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render the primary-harness supervision operating block for session start and
 # the short repair line used by guards and turn-end hooks. On a non-Pi primary
-# with a supervision protocol (claude, cursor, opencode, omp, grok, codex) whose
+# with a supervision protocol (claude, cursor, opencode, omp, grok, codex, agy) whose
 # home runs the supervision host (fm_supervision_host_enabled in
 # bin/fm-supervision-engine-lib.sh: by default on Claude, by
 # config/supervision-host elsewhere, never with config/supervision-host-off), the block
@@ -11,6 +11,9 @@
 # command becomes the host; on a home that does not run it the output is
 # unchanged.
 set -eu
+
+# Template replacements must stay literal on Bash 5.2+ and stock macOS Bash.
+shopt -u patsub_replacement 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -101,7 +104,7 @@ if [ -z "$HARNESS" ]; then
 fi
 
 case "$HARNESS" in
-  claude|codex|opencode|pi|grok|cursor|omp) SNIPPET="$DOC_DIR/$HARNESS.md" ;;
+  claude|codex|opencode|pi|grok|cursor|omp|agy) SNIPPET="$DOC_DIR/$HARNESS.md" ;;
   pi-signed) SNIPPET="$DOC_DIR/pi.md" ;;
   *) HARNESS=unknown; SNIPPET="$DOC_DIR/unknown.md" ;;
 esac
@@ -109,7 +112,7 @@ esac
 HOST_SNIPPET=
 grok_arm='bin/fm-watch-arm.sh'
 case "$HARNESS" in
-  claude|cursor|opencode|omp|grok|codex)
+  claude|cursor|opencode|omp|grok|codex|agy)
     # shellcheck source=bin/fm-supervision-engine-lib.sh
     . "$SCRIPT_DIR/fm-supervision-engine-lib.sh"
     if fm_supervision_host_enabled "$CONFIG" "$HARNESS"; then
@@ -125,6 +128,21 @@ pi_turnend_ext="$FM_ROOT/.pi/extensions/fm-primary-turnend-guard.ts"
 omp_ext="$FM_ROOT/.omp/extensions/fm-primary-omp-watch.ts"
 omp_turnend_ext="$FM_ROOT/.omp/extensions/fm-primary-turnend-guard.ts"
 x_mode_env="$CONFIG/x-mode.env"
+
+# True when the active home is not the firstmate checkout: omp's extensions load
+# from the checkout, and only the `fm <project>` launcher points them at another home.
+omp_home_elsewhere=0
+if [ "$(cd -P "$FM_HOME" 2>/dev/null && pwd -P || printf '%s' "$FM_HOME")" != "$(cd -P "$FM_ROOT" 2>/dev/null && pwd -P || printf '%s' "$FM_ROOT")" ]; then
+  omp_home_elsewhere=1
+fi
+# shellcheck disable=SC2016  # backticks are literal markdown in the rendered text
+if [ "$omp_home_elsewhere" -eq 1 ]; then
+  omp_restart_long='exit omp and relaunch through `fm <project>`, which sets FM_HOME and --cwd; a bare omp or /resume from the firstmate checkout does not register the extensions for this home'
+  omp_restart_short='exit omp and relaunch through `fm <project>`'
+else
+  omp_restart_long="restart omp inside this home; pass \`-e $omp_turnend_ext -e $omp_ext\` only when omp must start from another directory, because omp loads a file named both ways twice"
+  omp_restart_short='restart omp inside this home'
+fi
 
 shell_quote() {
   printf "'"
@@ -151,6 +169,8 @@ render_snippet() {  # [snippet]
     esac
     line=${line//__FM_PI_EXT__/$pi_ext}
     line=${line//__FM_PI_TURNEND_EXT__/$pi_turnend_ext}
+    line=${line//__FM_OMP_RESTART_LONG__/$omp_restart_long}
+    line=${line//__FM_OMP_RESTART_SHORT__/$omp_restart_short}
     line=${line//__FM_OMP_EXT__/$omp_ext}
     line=${line//__FM_OMP_TURNEND_EXT__/$omp_turnend_ext}
     line=${line//__FM_X_MODE_ENV_SH__/$x_mode_env_sh}
@@ -193,7 +213,12 @@ repair_line() {
       printf '%s%s%s%s%s%s\n' "$prefix" 'repair a missing or failed watcher cycle with the Pi tool fm_watch_arm_pi, or restart Pi with -e ' "$pi_turnend_ext" ' -e ' "$pi_ext" ' if the extensions are not loaded.'
       ;;
     omp)
-      printf '%s%s%s%s%s%s\n' "$prefix" 'repair a missing or failed watcher cycle with the omp tool fm_watch_arm_omp, or restart omp inside this home so ' "$omp_turnend_ext" ' and ' "$omp_ext" ' auto-load from .omp/extensions/ (use -e with both paths only when starting omp from another directory).'
+      # shellcheck disable=SC2016  # backticks are literal markdown in the rendered text
+      if [ "$omp_home_elsewhere" -eq 1 ]; then
+        printf '%s%s%s%s%s%s\n' "$prefix" 'repair a missing or failed watcher cycle with the omp tool fm_watch_arm_omp, or exit omp and relaunch through `fm <project>` (the launcher sets FM_HOME and --cwd) so ' "$omp_turnend_ext" ' and ' "$omp_ext" ' load for this home; a bare omp or /resume from the firstmate checkout does not register the extensions for this home.'
+      else
+        printf '%s%s%s%s%s%s\n' "$prefix" 'repair a missing or failed watcher cycle with the omp tool fm_watch_arm_omp, or restart omp inside this home so ' "$omp_turnend_ext" ' and ' "$omp_ext" ' auto-load from .omp/extensions/ (use -e with both paths only when starting omp from another directory).'
+      fi
       ;;
     opencode)
       printf '%s%s\n' "$prefix" 'repair missing watcher supervision by letting the OpenCode TUI plugin arm after idle; use bin/fm-watch-arm.sh only as a manual recovery probe if the plugin reports failure.'
@@ -203,6 +228,13 @@ repair_line() {
       ;;
     cursor)
       printf '%s%s\n' "$prefix" 'watcher supervision is owned by the stop-hook park; inspect the hook registration and watcher startup path before ending the turn.'
+      ;;
+    agy)
+      if [ -n "$HOST_SNIPPET" ]; then
+        printf '%s%s\n' "$prefix" 'supervision is owned by the Stop-hook park (.agents/hooks.json -> bin/fm-turnend-guard-agy.sh running the supervision host); inspect the hook registration and supervision host startup path before ending the turn.'
+      else
+        printf '%s%s\n' "$prefix" 'watcher supervision is owned by the Stop-hook park (.agents/hooks.json -> bin/fm-turnend-guard-agy.sh); inspect the hook registration and watcher startup path before ending the turn.'
+      fi
       ;;
     *)
       printf '%s%s\n' "$prefix" 'repair missing watcher supervision according to the session-start block for this harness; do not use shell &.'
@@ -232,6 +264,9 @@ ordinary_wake_line() {
       ;;
     cursor)
       printf '%s\n' '- Ordinary wake: the stop-hook park (bin/fm-turnend-guard-cursor.sh) already owns watcher continuity; drain and handle the wake, and do not arm another cycle yourself.'
+      ;;
+    agy)
+      printf '%s\n' '- Ordinary wake: the Stop-hook park (bin/fm-turnend-guard-agy.sh) already owns watcher continuity; drain and handle the wake, and do not arm another cycle yourself.'
       ;;
     *)
       printf '%s\n' '- Ordinary wake: follow the continuation in the harness protocol below; do not use shell &.'
